@@ -134,6 +134,21 @@ public class FeaturesConfig
 
     private boolean legacyVarcharToCharCoercion;
 
+    private boolean unwrapFromUnixTimeInComparisonEnabled = true;
+
+    public boolean isUnwrapFromUnixTimeInComparisonEnabled()
+    {
+        return unwrapFromUnixTimeInComparisonEnabled;
+    }
+
+    @Config("optimizer.unwrap-from-unixtime-in-comparison.enabled")
+    @ConfigDescription("Rewrite comparisons on from_unixtime(...) chains into comparisons on the underlying column")
+    public FeaturesConfig setUnwrapFromUnixTimeInComparisonEnabled(boolean unwrapFromUnixTimeInComparisonEnabled)
+    {
+        this.unwrapFromUnixTimeInComparisonEnabled = unwrapFromUnixTimeInComparisonEnabled;
+        return this;
+    }
+
     public boolean isRedistributeWrites()
     {
         return redistributeWrites;

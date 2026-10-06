@@ -162,3 +162,37 @@ WHERE ts >= <按原比较语义折叠的起始 epoch 毫秒>
 
 - 根据真实查询需求扩展等值比较、其他范围比较、非整秒边界或 JSON 链，每项均单独定义反算规则和等价性测试。
 - SQLFluff lint 与内部 SQL 规范仍可独立交付，不作为本规则落地的前置条件。
+
+---
+
+# v2：全量 from_unixtime 覆盖（2026-10-05 批准，仅 Tier A）
+
+v1 只覆盖固定模式 `from_unixtime(bigint列 / 1000 [, 常量时区]) >= / < 整秒常量`。v2 扩展为通用反算，**不做**：JSON/TRY_CAST 源（无列可下推，无收益）、外层无时区 CAST（固定偏移时区才可逆，本期不做）、非常量时区、`from_unixtime_nanos` 的 decimal 变体。
+
+## 覆盖矩阵
+
+**函数变体**：`from_unixtime(x)`、`from_unixtime(x, 常量zone)`、`from_unixtime(x, 常量h, 常量m)`、`from_unixtime_nanos(bigint列)`。
+
+**输入表达式 E(n)**（n 为列引用）：
+- `CAST(n AS double)`（n bigint）—— f(n) = 1000n，与整数除法 c=1 统一；
+- n 为 double 列 —— f(x) = round(1000x)，double 阈值边界；
+- `n / c`（bigint 除法，c 为任意正整数常量）—— f(n) = 1000·trunc(n/c)，L(k) 推广为 L(k)=c·k（k>0）/ c·k−c+1（k≤0）；
+- `n / d`（double 除法，d 为任意正常量）—— 阈值 t = d·(m∓0.5)/1000 有理数域计算，整数列收紧为 ceil/floor。
+
+**比较符**：`=`、`<>`、`<`、`<=`、`>`、>=` 全部；链在右时翻转。`BETWEEN` 在 IR 中已脱糖为 `>= AND <=`，自动覆盖；`IN` 按 `UnwrapYearInComparison.rewriteIn` 逐元素走等值反算，全部成功才改写。
+
+**常量**：任意精度 timestamp with time zone（含亚毫秒，按 BigDecimal 精确处理），无时区常量按 session 时区折叠后同 v1。
+
+## 统一反算模型
+
+把比较统一反算为叶子列上的条件。设常量 T 的精确毫秒值为有理数 m（短表示取 epochMillis；长表示 epochMillis + picosOfMilli/10⁹）。
+
+- **整数输出链**（identity-int、int 除法，f 输出恒为整千毫秒）：先算 q 的整数阈值（ceilDiv/floorDiv(m,1000)），再经 L(k) 落到 n；`=` 在非整秒 m 时恒假（改写为 FALSE），`<>` 恒真。
+- **double 链**（double 列、double 除法）：阈值 t=d·(m∓0.5)/1000 在 BigDecimal 域计算；整数列叶子取 ceil/floor；double 列叶子用最小/最大可用 double 边界（leastDoubleGE / greatestDoubleLE，BigDecimal 精确比较 + nextUp/nextDown 修正），`<` 用 `<= pred(leastGE(t))`、`>` 用 `>= succ(greatestLE(t))` 保持方向精确。
+- **nanos 链**：f(n)=n（纳秒恒等），n 直接与常量 epoch 纳秒比较；亚纳秒部分按比较符 ceil/floor 收紧。
+
+## 已接受的语义偏差（沿用 v1 并补充）
+
+- 超范围/NaN 输入的报错与过滤差异同 v1；
+- double 除法链依赖 `round(n/d*1000)` 在 epoch 值域内的浮点误差远小于 0.5ms 的事实（|n|≤2⁵³ 时成立）；
+- 等值反算产生的恒假/恒真改写仅对"原式确定不产生错误"的输入成立。
