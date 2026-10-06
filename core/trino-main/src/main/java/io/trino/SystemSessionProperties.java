@@ -86,6 +86,7 @@ public final class SystemSessionProperties
     public static final String QUERY_MAX_WRITE_PHYSICAL_SIZE = "query_max_write_physical_size";
     public static final String QUERY_MAX_STAGE_COUNT = "query_max_stage_count";
     public static final String REDISTRIBUTE_WRITES = "redistribute_writes";
+    public static final String UNWRAP_FROM_UNIXTIME_IN_COMPARISON_ENABLED = "unwrap_from_unixtime_in_comparison_enabled";
     public static final String USE_PREFERRED_WRITE_PARTITIONING = "use_preferred_write_partitioning";
     public static final String SCALE_WRITERS = "scale_writers";
     public static final String TASK_SCALE_WRITERS_ENABLED = "task_scale_writers_enabled";
@@ -319,6 +320,11 @@ public final class SystemSessionProperties
                         REDISTRIBUTE_WRITES,
                         "Force parallel distributed writes",
                         featuresConfig.isRedistributeWrites(),
+                        false),
+                booleanProperty(
+                        UNWRAP_FROM_UNIXTIME_IN_COMPARISON_ENABLED,
+                        "Rewrite comparisons on from_unixtime(...) chains into comparisons on the underlying column",
+                        featuresConfig.isUnwrapFromUnixTimeInComparisonEnabled(),
                         false),
                 booleanProperty(
                         USE_PREFERRED_WRITE_PARTITIONING,
@@ -1242,6 +1248,11 @@ public final class SystemSessionProperties
     public static boolean isRedistributeWrites(Session session)
     {
         return session.getSystemProperty(REDISTRIBUTE_WRITES, Boolean.class);
+    }
+
+    public static boolean isUnwrapFromUnixTimeInComparisonEnabled(Session session)
+    {
+        return session.getSystemProperty(UNWRAP_FROM_UNIXTIME_IN_COMPARISON_ENABLED, Boolean.class);
     }
 
     public static boolean isUsePreferredWritePartitioning(Session session)

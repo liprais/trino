@@ -40,6 +40,7 @@ public class TestFeaturesConfig
     {
         assertRecordedDefaults(recordDefaults(FeaturesConfig.class)
                 .setRedistributeWrites(true)
+                .setUnwrapFromUnixTimeInComparisonEnabled(true)
                 .setScaleWriters(true)
                 .setWriterScalingMinDataProcessed(DataSize.of(120, MEGABYTE))
                 .setMaxMemoryPerPartitionWriter(DataSize.of(256, MEGABYTE))
@@ -77,6 +78,7 @@ public class TestFeaturesConfig
     {
         Map<String, String> properties = ImmutableMap.<String, String>builder()
                 .put("redistribute-writes", "false")
+                .put("optimizer.unwrap-from-unixtime-in-comparison.enabled", "false")
                 .put("scale-writers", "false")
                 .put("writer-scaling-min-data-processed", "4GB")
                 .put("max-memory-per-partition-writer", "4GB")
@@ -111,6 +113,7 @@ public class TestFeaturesConfig
 
         FeaturesConfig expected = new FeaturesConfig()
                 .setRedistributeWrites(false)
+                .setUnwrapFromUnixTimeInComparisonEnabled(false)
                 .setScaleWriters(false)
                 .setWriterScalingMinDataProcessed(DataSize.of(4, GIGABYTE))
                 .setMaxMemoryPerPartitionWriter(DataSize.of(4, GIGABYTE))
