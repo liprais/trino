@@ -452,9 +452,9 @@ public class TestUnwrapFromUnixTimeInComparison
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, afterFallBack)));
 
         // fixed +08:00 zones never changed offset and stay exact for any date
-        long gmt8_1988 = ZonedDateTime.of(1988, 6, 1, 0, 0, 0, 0, ZoneId.of("GMT+8")).toEpochSecond() * 1000;
+        long gmt8At1988 = ZonedDateTime.of(1988, 6, 1, 0, 0, 0, 0, ZoneId.of("GMT+8")).toEpochSecond() * 1000;
         assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("GMT+8")), dstEra)))
-                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, gmt8_1988)));
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, gmt8At1988)));
     }
 
     @Test

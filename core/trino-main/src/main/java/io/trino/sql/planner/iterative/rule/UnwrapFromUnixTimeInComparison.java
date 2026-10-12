@@ -387,7 +387,7 @@ public class UnwrapFromUnixTimeInComparison
             }
             boolean matches = switch (domain) {
                 case Domain.Tz() -> constant.type() instanceof TimestampWithTimeZoneType;
-                case Domain.Local ignored -> constant.type() instanceof TimestampType;
+                case Domain.Local _ -> constant.type() instanceof TimestampType;
             };
             return matches ? Optional.of(constant) : Optional.empty();
         }
@@ -668,7 +668,7 @@ public class UnwrapFromUnixTimeInComparison
             return switch (chain) {
                 case IntChain intChain -> invertInt(intChain, operator, millis);
                 case DoubleChain doubleChain -> invertDouble(doubleChain, operator, millis);
-                case NanosChain ignored -> Optional.empty();
+                case NanosChain _ -> Optional.empty();
             };
         }
 
