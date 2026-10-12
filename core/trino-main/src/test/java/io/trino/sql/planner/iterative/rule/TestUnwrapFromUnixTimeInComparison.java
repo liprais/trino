@@ -37,7 +37,11 @@ import io.trino.type.DateTimes;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.zone.ZoneOffsetTransition;
+import java.time.zone.ZoneRules;
 import java.time.ZonedDateTime;
 import java.util.List;
 
@@ -49,6 +53,7 @@ import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.TimeZoneKey.getTimeZoneKey;
 import static io.trino.spi.type.TimestampType.TIMESTAMP_MICROS;
+import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS;
 import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_MILLIS;
 import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_NANOS;
@@ -66,6 +71,7 @@ import static io.trino.sql.ir.ComparisonOperator.NOT_EQUAL;
 import static io.trino.sql.ir.IrExpressions.not;
 import static io.trino.sql.ir.Logical.Operator.AND;
 import static io.trino.sql.ir.Logical.Operator.OR;
+import static io.trino.sql.ir.TestingIr.between;
 import static io.trino.sql.ir.TestingIr.comparison;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.anyTree;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.filter;
@@ -235,6 +241,431 @@ public class TestUnwrapFromUnixTimeInComparison
                 new Cast(division(N, 1000), DOUBLE), new Constant(BIGINT, 8L), new Constant(BIGINT, 0L)));
         assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, offsetChain, tzConstant(3, 1000, "UTC"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 1000L)));
+    }
+
+    @Test
+    public void testInstantPreservingAtTimeZoneIsPeeled()
+    {
+        // `value AT TIME ZONE <constant zone>` only relabels the zone and never changes the instant, so the
+        // comparison can be inverted onto the chain behind it
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, atTimeZone(chain(), "UTC"), tzConstant(3, 1000, "UTC"))))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 1000L)));
+        assertThat(unwrap(comparison(LESS_THAN, atTimeZone(chain("Asia/Shanghai"), "+08:00"), tzConstant(3, 0, "UTC"))))
+                .isEqualTo(comparison(LESS_THAN, N, new Constant(BIGINT, -999L)));
+        // constant on the left
+        assertThat(unwrap(comparison(LESS_THAN_OR_EQUAL, tzConstant(3, 1000, "UTC"), atTimeZone(chain(), "Asia/Shanghai"))))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 1000L)));
+        assertThat(unwrap(comparison(GREATER_THAN, atTimeZone(chain(), "UTC"), tzConstant(3, 1000, "UTC"))))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 2000L)));
+        // NULL, non-constant and invalid zones keep the original call so that NULL and error semantics survive
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, atTimeZone(chain(), (String) null), tzConstant(3, 1000, "UTC")));
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, atTimeZone(chain(), "Not/AZone"), tzConstant(3, 1000, "UTC")));
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+                atTimeZone(chain(), new Reference(createVarcharType(3), "zone")), tzConstant(3, 1000, "UTC")));
+    }
+
+    @Test
+    public void testWallClockDomainRangeOperators()
+    {
+        // the wall clock 2026-09-01 00:00:00 in Asia/Shanghai is the instant 2026-08-31T16:00Z
+        long instant = ZonedDateTime.of(2026, 9, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+
+        // from_unixtime(n / 1000) renders whole seconds, so the leaf grid is 1000 millis wide
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, wallClockChain("Asia/Shanghai"), boundary)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant)));
+        assertThat(unwrap(comparison(LESS_THAN, wallClockChain("Asia/Shanghai"), boundary)))
+                .isEqualTo(comparison(LESS_THAN, N, new Constant(BIGINT, instant)));
+        assertThat(unwrap(comparison(LESS_THAN_OR_EQUAL, wallClockChain("Asia/Shanghai"), boundary)))
+                .isEqualTo(comparison(LESS_THAN, N, new Constant(BIGINT, instant + 1000)));
+        assertThat(unwrap(comparison(GREATER_THAN, wallClockChain("Asia/Shanghai"), boundary)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant + 1000)));
+
+        // a precision-only widening cast on the wall clock side is peeled
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
+                castToTimestamp(wallClockChain("Asia/Shanghai"), 6), localTimestamp(6, "2026-09-01 00:00:00.000000"))))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant)));
+
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            Expression original = comparison(operator, wallClockChain("Asia/Shanghai"), boundary);
+            Expression rewritten = unwrap(original);
+            assertThat(rewritten).isNotEqualTo(original);
+            for (long n : new long[] {instant - 1000, instant, instant + 1, instant + 500, instant + 1000, instant + 2000}) {
+                assertThat(evaluate(rewritten, n))
+                        .as("operator %s, n=%s", operator, n)
+                        .isEqualTo(evaluate(original, n));
+            }
+        }
+    }
+
+    @Test
+    public void testWallClockDomainWideningPreservesRejectedZone()
+    {
+        for (int precision : List.of(6, 9, 12)) {
+            Expression value = castToTimestamp(new Cast(atTimeZone(chain("Asia/Shanghai"), "UTC"),
+                    createTimestampWithTimeZoneType(precision)), precision);
+            Constant boundary = localTimestamp(precision, "2026-09-01 00:00:00." + "0".repeat(precision));
+            for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+                assertUnchanged(comparison(operator, value, boundary));
+            }
+            // UTC renders this instant as August 31, so it must not be admitted as Shanghai's midnight.
+            assertThat(evaluate(comparison(GREATER_THAN_OR_EQUAL, value, boundary), METABASE_BOUNDARY_K * 1000))
+                    .isFalse();
+        }
+    }
+
+    @Test
+    public void testWallClockDomainWideningPreservesOutermostZone()
+    {
+        for (int precision : List.of(6, 9, 12)) {
+            for (String zone : List.of("Asia/Shanghai", "+08:00")) {
+                Expression inner = new Cast(atTimeZone(chain("UTC"), "America/New_York"), TIMESTAMP_TZ_MICROS);
+                Expression value = atTimeZone(inner, zone);
+                if (precision > 6) {
+                    value = new Cast(value, createTimestampWithTimeZoneType(precision));
+                }
+                value = castToTimestamp(value, precision);
+                Constant boundary = localTimestamp(precision, "2026-09-01 00:00:00." + "0".repeat(precision));
+                for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+                    Expression original = comparison(operator, value, boundary);
+                    Expression rewritten = unwrap(original);
+                    assertThat(rewritten).isEqualTo(unwrap(comparison(operator, castToTimestamp(chain(zone), precision), boundary)));
+                    for (Long n : new Long[] {METABASE_BOUNDARY_K * 1000 - 1, METABASE_BOUNDARY_K * 1000,
+                            METABASE_BOUNDARY_K * 1000 + 1, METABASE_BOUNDARY_K * 1000 + 999,
+                            METABASE_BOUNDARY_K * 1000 + 1000, METABASE_BOUNDARY_K * 1000 + 28_800_000, null}) {
+                        assertThat(evaluate(rewritten, n))
+                                .as("precision %s, zone %s, operator %s, n=%s", precision, zone, operator, n)
+                                .isEqualTo(evaluate(original, n));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testWallClockDomainWideningPreservesInvalidZoneSemantics()
+    {
+        Constant boundary = localTimestamp(6, "2026-09-01 00:00:00");
+        for (Expression invalidZone : List.of(new Constant(createVarcharType(1), null),
+                new Constant(createVarcharType(9), utf8Slice("Not/AZone")), new Reference(createVarcharType(13), "zone"))) {
+            Expression inner = atTimeZone(chain("Asia/Shanghai"), invalidZone);
+            Expression widened = new Cast(inner, TIMESTAMP_TZ_MICROS);
+            Expression original = comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(widened, 6), boundary);
+            assertUnchanged(original);
+            // A valid outer zone must not hide a NULL, invalid or dynamic inner zone.
+            assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(atTimeZone(widened, "Asia/Shanghai"), 6), boundary));
+        }
+    }
+
+    @Test
+    public void testCastToTimestampOnlyAsiaShanghaiIsUnwrapped()
+    {
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+        long shanghai = ZonedDateTime.of(2026, 9, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+
+        // the one-argument from_unixtime attaches the session zone, and the zoneless cast renders in that zone
+        Session shanghaiSession = testSessionBuilder().setTimeZoneKey(getTimeZoneKey("Asia/Shanghai")).build();
+        assertThat(unwrap(shanghaiSession, comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain()), boundary)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, shanghai)));
+        // an explicit Asia/Shanghai zone argument also matches, regardless of the session zone
+        Session utcSession = testSessionBuilder().setTimeZoneKey(getTimeZoneKey("UTC")).build();
+        assertThat(unwrap(utcSession, comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("Asia/Shanghai")), boundary)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, shanghai)));
+
+        // fixed +08:00 zones render the same wall clock as Asia/Shanghai and are unwrapped as well;
+        // GMT+8 is normalized to +08:00 by TimeZoneKey, and the +08:00 form matches directly
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("GMT+8")), boundary)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, shanghai)));
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("+08:00")), boundary)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, shanghai)));
+
+        // every other zone is left alone, even fixed-offset ones with a different offset:
+        // a non-Shanghai session zone, and an explicit UTC zone
+        assertUnchanged(utcSession, comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain()), boundary));
+        assertUnchanged(shanghaiSession, comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("UTC")), boundary));
+    }
+
+    @Test
+    public void testWallClockDomainShanghaiDaylightSavingEraIsRejected()
+    {
+        // Asia/Shanghai ran daylight saving time 1986-1991, so the wall clock is not a pure shift of the
+        // instant that far back; thresholds reaching into that era are abandoned
+        Constant dstEra = localTimestamp("1988-06-01 00:00:00.000");
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            assertUnchanged(comparison(operator, wallClockChain("Asia/Shanghai"), dstEra));
+        }
+
+        // right after the era the inversion applies again
+        long shanghai1992 = ZonedDateTime.of(1992, 1, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("Asia/Shanghai")), localTimestamp("1992-01-01 00:00:00.000"))))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, shanghai1992)));
+
+        // fixed +08:00 zones never changed offset and stay exact for any date
+        long gmt8_1988 = ZonedDateTime.of(1988, 6, 1, 0, 0, 0, 0, ZoneId.of("GMT+8")).toEpochSecond() * 1000;
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("GMT+8")), dstEra)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, gmt8_1988)));
+    }
+
+    @Test
+    public void testWallClockDomainSubMillisecondConstants()
+    {
+        // constants off the millisecond grid: the bound is rounded toward the strict side (ceil for >= and <,
+        // floor+1 for <= and >) and then inverted exactly; equivalence is checked point-wise across the leaf
+        // grid, which renders whole seconds
+        long instant = ZonedDateTime.of(2026, 9, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+        Expression chain6 = castToTimestamp(atTimeZone(chain(), "Asia/Shanghai"), 6);
+        for (String value : List.of("2026-09-01 00:00:00.000500", "2026-09-01 00:00:00.999500", "2026-08-31 23:59:59.999500")) {
+            Constant boundary = localTimestamp(6, value);
+            for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+                Expression original = comparison(operator, chain6, boundary);
+                Expression rewritten = unwrap(original);
+                assertThat(rewritten).as("operator %s, constant %s", operator, value).isNotEqualTo(original);
+                for (long n = instant - 2000; n <= instant + 3000; n += 250) {
+                    assertThat(evaluate(rewritten, n))
+                            .as("operator %s, constant %s, n=%s", operator, value, n)
+                            .isEqualTo(evaluate(original, n));
+                }
+                for (long n : new long[] {instant - 1, instant, instant + 1, instant + 999, instant + 1000}) {
+                    assertThat(evaluate(rewritten, n))
+                            .as("operator %s, constant %s, n=%s", operator, value, n)
+                            .isEqualTo(evaluate(original, n));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testWallClockDomainNegativeEpoch()
+    {
+        // 1969 is inside Asia/Shanghai's daylight saving guard, so this uses a fixed +08:00 zone; the point is
+        // bigint division truncating toward zero on negative inputs (n=-1500 renders -1s, not -2s)
+        long instant = ZonedDateTime.of(1969, 12, 31, 23, 59, 59, 0, ZoneId.of("GMT+8")).toEpochSecond() * 1000;
+        Constant boundary = localTimestamp("1969-12-31 23:59:59.000");
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            Expression original = comparison(operator, castToTimestamp(chain("GMT+8")), boundary);
+            Expression rewritten = unwrap(original);
+            assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
+            for (long n : new long[] {instant - 2500, instant - 1500, instant - 1001, instant - 1000, instant - 999,
+                    instant - 500, instant - 1, instant, instant + 1, instant + 500, instant + 999, instant + 1000, instant + 1500}) {
+                assertThat(evaluate(rewritten, n))
+                        .as("operator %s, n=%s", operator, n)
+                        .isEqualTo(evaluate(original, n));
+            }
+        }
+    }
+
+    @Test
+    public void testWallClockDomainShanghaiGuardBoundary()
+    {
+        // the guard compares the rounded millisecond grid threshold k against lastChange + 24h, so the
+        // boundary cases are k == lastChange + 24h (window starts exactly at the last offset change: allowed)
+        // and k == lastChange + 24h - 1 (one millisecond into the daylight saving era: abandoned)
+        List<ZoneOffsetTransition> transitions = ZoneId.of("Asia/Shanghai").getRules().getTransitions();
+        long lastChange = transitions.get(transitions.size() - 1).getInstant().toEpochMilli();
+        long guardK = lastChange + 86_400_000L;
+
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN)) {
+            assertUnchanged(comparison(operator, wallClockChain("Asia/Shanghai"), localTimestamp(guardK - 1)));
+        }
+        // <= and > round to floor(k)+1, so their bound is exactly guardK at this constant: allowed
+        for (ComparisonOperator operator : List.of(LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            assertThat(unwrap(comparison(operator, wallClockChain("Asia/Shanghai"), localTimestamp(guardK - 1))))
+                    .isNotEqualTo(comparison(operator, wallClockChain("Asia/Shanghai"), localTimestamp(guardK - 1)));
+        }
+
+        // k == guardK is allowed and exact; the threshold instant is guardK - 8h (fixed +08:00 across the window)
+        long threshold = guardK - 8 * 3_600_000L;
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            Expression original = comparison(operator, wallClockChain("Asia/Shanghai"), localTimestamp(guardK));
+            Expression rewritten = unwrap(original);
+            assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
+            for (long n : new long[] {threshold - 2000, threshold - 1000, threshold - 1, threshold, threshold + 1, threshold + 1000, threshold + 2000}) {
+                assertThat(evaluate(rewritten, n))
+                        .as("operator %s, n=%s", operator, n)
+                        .isEqualTo(evaluate(original, n));
+            }
+        }
+    }
+
+    @Test
+    public void testWallClockDomainRejectsFallBackTransitions()
+    {
+        // a fall-back renders the same wall clock twice, so the satisfying rows are not a single instant range
+        ZoneOffsetTransition fallBack = nextTransition(false);
+        long repeatedWallClock = wallClockMillis(fallBack.getDateTimeBefore().minusMinutes(30));
+        Constant boundary = localTimestamp(repeatedWallClock);
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            assertUnchanged(comparison(operator, wallClockChain("America/New_York"), boundary));
+        }
+    }
+
+    @Test
+    public void testWallClockDomainRejectsNonShanghaiZones()
+    {
+        // zones with daylight saving transitions are never unwrapped, even on dates far from any transition:
+        // the rule does not reason about monotonicity at all, it simply only knows +08:00 zones
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+        for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+            assertUnchanged(comparison(operator, wallClockChain("America/New_York"), boundary));
+            assertUnchanged(comparison(operator, wallClockChain("Europe/London"), boundary));
+            assertUnchanged(comparison(operator, wallClockChain("UTC"), boundary));
+            // a fixed offset other than +08:00 does not match either
+            assertUnchanged(comparison(operator, wallClockChain("GMT+7"), boundary));
+        }
+    }
+
+    @Test
+    public void testWallClockDomainScope()
+    {
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+        Expression chain = wallClockChain("Asia/Shanghai");
+
+        // equality and IN would also have to reason about wall clocks rendered twice or not at all
+        assertUnchanged(comparison(EQUAL, chain, boundary));
+        assertUnchanged(comparison(NOT_EQUAL, chain, boundary));
+        assertUnchanged(new In(chain, ImmutableList.of(boundary)));
+
+        // non-constant zone
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+                castToTimestamp(atTimeZone(chain(), new Reference(createVarcharType(3), "zone"))), boundary));
+
+
+        // the nanosecond chain renders on a nanosecond grid
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(nanosChain(), 9),
+                new Constant(createTimestampType(9), DateTimes.parseTimestamp(9, "2026-09-01 00:00:00.000000000"))));
+    }
+
+    // the chain can sit on the right of the comparison: the operator flips and the same wall clock bounds
+    // apply, which must also hold for the strict operators whose bound is rounded toward the strict side
+    @Test
+    public void testWallClockDomainFlippedComparison()
+    {
+        long instant = METABASE_BOUNDARY_K * 1000;
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+        Expression wallClock = wallClockChain("Asia/Shanghai");
+
+        // boundary <= chain  <=>  chain >= boundary
+        assertThat(unwrap(comparison(LESS_THAN_OR_EQUAL, boundary, wallClock)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant)));
+        // boundary < chain  <=>  chain > boundary  <=>  chain >= boundary + 1s
+        assertThat(unwrap(comparison(LESS_THAN, boundary, wallClock)))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant + 1000)));
+        // boundary >= chain  <=>  chain <= boundary  <=>  chain < boundary + 1s
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, boundary, wallClock)))
+                .isEqualTo(comparison(LESS_THAN, N, new Constant(BIGINT, instant + 1000)));
+        // boundary > chain  <=>  chain < boundary
+        assertThat(unwrap(comparison(GREATER_THAN, boundary, wallClock)))
+                .isEqualTo(comparison(LESS_THAN, N, new Constant(BIGINT, instant)));
+
+        for (ComparisonOperator operator : List.of(LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL)) {
+            Expression original = comparison(operator, boundary, wallClock);
+            Expression rewritten = unwrap(original);
+            assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
+            for (long n : new long[] {instant - 1000, instant - 1, instant, instant + 1, instant + 999,
+                    instant + 1000, instant + 1001, instant + 2000}) {
+                assertThat(evaluate(rewritten, n))
+                        .as("operator %s, n=%s", operator, n)
+                        .isEqualTo(evaluate(original, n));
+            }
+        }
+    }
+
+    @Test
+    public void testWallClockDomainPrecisionGuards()
+    {
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+        long instant = METABASE_BOUNDARY_K * 1000;
+        Expression wallClock = atTimeZone(chain("Asia/Shanghai"), "Asia/Shanghai");
+
+        // rendering below millisecond precision rounds the wall clock onto a coarser grid that the rule does
+        // not invert, so the comparison is left alone
+        for (int precision : List.of(0, 1, 2)) {
+            Constant rounded = localTimestamp(precision, "2026-09-01 00:00:00");
+            for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
+                assertUnchanged(comparison(operator, castToTimestamp(wallClock, precision), rounded));
+            }
+        }
+
+        // narrowing a zoneless timestamp rounds it as well, so it is not peeled
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(castToTimestamp(wallClock, 6), 3), boundary));
+
+        // widening a zoneless timestamp is lossless and only peeled
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
+                castToTimestamp(castToTimestamp(wallClock, 6), 9), localTimestamp(9, "2026-09-01 00:00:00.000000000"))))
+                .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant)));
+    }
+
+    // BETWEEN renders the chain twice, so the planner desugars it to a Let; both bounds must be inverted and
+    // the Let must disappear, otherwise the predicate never reaches the scan
+    @Test
+    public void testWallClockDomainBetweenIsFullyUnwrapped()
+    {
+        long lowInstant = METABASE_BOUNDARY_K * 1000;
+        long highInstant = ZonedDateTime.of(2026, 10, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+        Expression letForm = between(
+                castToTimestamp(chain("Asia/Shanghai")),
+                localTimestamp("2026-09-01 00:00:00.000"),
+                localTimestamp("2026-10-01 00:00:00.000"));
+
+        Expression rewritten = unwrap(letForm);
+        assertThat(rewritten).isEqualTo(new Logical(AND, ImmutableList.of(
+                comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, lowInstant)),
+                comparison(LESS_THAN, N, new Constant(BIGINT, highInstant + 1000)))));
+
+        // inclusive upper bound: the whole final second of the wall clock satisfies it
+        for (Long n : new Long[] {lowInstant - 1000, lowInstant - 1, lowInstant, lowInstant + 1,
+                highInstant - 1, highInstant, highInstant + 999, highInstant + 1000, highInstant + 1001, null}) {
+            assertThat(evaluate(rewritten, n)).as("n=%s", n).isEqualTo(evaluate(letForm, n));
+        }
+    }
+
+    @Test
+    public void testWallClockDomainFixedPlusEightZones()
+    {
+        long instant = METABASE_BOUNDARY_K * 1000;
+        Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
+        Expression expected = comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant));
+
+        // the three-argument form attaches a fixed offset zone
+        Expression offsetChain = new Call(FROM_UNIXTIME_OFFSET, ImmutableList.of(
+                new Cast(division(N, 1000), DOUBLE), new Constant(BIGINT, 8L), new Constant(BIGINT, 0L)));
+        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(offsetChain), boundary)))
+                .isEqualTo(expected);
+
+        // every fixed +08:00 zone renders the same wall clock, not only the two well-known spellings
+        for (String zone : List.of("Asia/Shanghai", "GMT+8", "+08:00", "Etc/GMT-8")) {
+            assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain(zone)), boundary)))
+                    .as("zone %s", zone)
+                    .isEqualTo(expected);
+        }
+
+        // a fixed zone with any other offset stays untouched
+        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(chain("Etc/GMT-7")), boundary));
+    }
+
+    // the first spring-forward (or fall-back) transition after mid 2025; scanning with nextTransition also
+    // resolves the recurring rules the time zone database keeps for the future
+    private static ZoneOffsetTransition nextTransition(boolean forward)
+    {
+        ZoneRules rules = ZoneId.of("America/New_York").getRules();
+        Instant instant = Instant.parse("2025-06-01T00:00:00Z");
+        for (int i = 0; i < 8; i++) {
+            ZoneOffsetTransition transition = rules.nextTransition(instant);
+            if (transition == null) {
+                break;
+            }
+            if ((transition.getOffsetAfter().getTotalSeconds() > transition.getOffsetBefore().getTotalSeconds()) == forward) {
+                return transition;
+            }
+            instant = transition.getInstant();
+        }
+        throw new IllegalStateException("no transition found");
+    }
+
+    // a wall clock as it is stored in a timestamp: epoch millis of the local date-time read as if it were UTC
+    private static long wallClockMillis(java.time.LocalDateTime wallClock)
+    {
+        return wallClock.toInstant(ZoneOffset.UTC).toEpochMilli();
     }
 
     @Test
@@ -539,8 +970,8 @@ public class TestUnwrapFromUnixTimeInComparison
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME_ZONE, ImmutableList.of(new Cast(division(N, 1000), DOUBLE), new Reference(createVarcharType(13), "zone"))),
                 tzConstant(3, 1000, "UTC")));
-        // outer cast to timestamp without time zone
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, new Cast(chain(), TIMESTAMP_MICROS), new Constant(TIMESTAMP_MICROS, DateTimes.parseTimestamp(6, "1970-01-01 00:00:01.000000"))));
+        // (an outer cast to a timestamp without time zone used to be out of scope; the wall clock domain
+        //  covers it now, see testWallClockDomainRangeOperators)
         // precision-lowering cast on the function side
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, new Cast(chain(), TIMESTAMP_TZ_SECONDS), tzConstant(0, 1000, "UTC")));
         // multiplication instead of division
@@ -828,9 +1259,44 @@ public class TestUnwrapFromUnixTimeInComparison
         }
     }
 
+    // the production Superset shape: the wall clock of the chain is compared after a zoneless CAST, so the
+    // filter must become a plain bigint range directly above the scan (pushdown and file pruning follow)
+    @Test
+    public void testWallClockDomainQueryFilterRewrittenToBigintRange()
+    {
+        Session session = Session.builder(getPlanTester().getDefaultSession())
+                .setTimeZoneKey(getTimeZoneKey("UTC"))
+                .build();
+        long low = ZonedDateTime.of(2026, 9, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+        long high = ZonedDateTime.of(2026, 10, 1, 0, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toEpochSecond() * 1000;
+
+        assertPlan(
+                """
+                SELECT count(*)
+                FROM (
+                    SELECT CAST(from_unixtime(orderkey / 1000) AT TIME ZONE 'Asia/Shanghai' AS TIMESTAMP) AS date, custkey
+                    FROM orders
+                ) AS virtual_table
+                WHERE date >= TIMESTAMP '2026-09-01 00:00:00'
+                  AND date < TIMESTAMP '2026-10-01 00:00:00'
+                """,
+                session,
+                output(anyTree(
+                        filter(
+                                new Logical(AND, ImmutableList.of(
+                                        comparison(GREATER_THAN_OR_EQUAL, new Reference(BIGINT, "ORDERKEY"), new Constant(BIGINT, low)),
+                                        comparison(LESS_THAN, new Reference(BIGINT, "ORDERKEY"), new Constant(BIGINT, high)))),
+                                tableScan("orders", ImmutableMap.of("ORDERKEY", "orderkey"))))));
+    }
+
     private static void assertUnchanged(Expression expression)
     {
         assertThat(unwrap(expression)).isEqualTo(expression);
+    }
+
+    private static void assertUnchanged(Session session, Expression expression)
+    {
+        assertThat(unwrap(session, expression)).isEqualTo(expression);
     }
 
     private static Expression unwrap(Expression expression)
@@ -881,6 +1347,51 @@ public class TestUnwrapFromUnixTimeInComparison
             expression = new Cast(expression, createTimestampWithTimeZoneType(precision));
         }
         return expression;
+    }
+
+    // at_timezone(value, zone); a null zone builds a NULL varchar constant
+    private static Expression atTimeZone(Expression value, String zone)
+    {
+        return atTimeZone(value, new Constant(createVarcharType(zone == null ? 1 : zone.length()), zone == null ? null : utf8Slice(zone)));
+    }
+
+    private static Expression atTimeZone(Expression value, Expression zone)
+    {
+        // AT TIME ZONE resolves per argument types; the zone varchar length is a literal parameter
+        return new Call(FUNCTIONS.resolveFunction("at_timezone", fromTypes(value.type(), zone.type())), ImmutableList.of(value, zone));
+    }
+
+    // timestamp(p) constant without a time zone, from its wall clock
+    private static Constant localTimestamp(String value)
+    {
+        return new Constant(createTimestampType(3), DateTimes.parseTimestamp(3, value));
+    }
+
+    private static Constant localTimestamp(int precision, String value)
+    {
+        return new Constant(createTimestampType(precision), DateTimes.parseTimestamp(precision, value));
+    }
+
+    private static Constant localTimestamp(long wallClockMillis)
+    {
+        return new Constant(createTimestampType(3), wallClockMillis * 1000);
+    }
+
+    // CAST(value AS timestamp(p)), the zoneless cast that renders the value's wall clock
+    private static Expression castToTimestamp(Expression value)
+    {
+        return castToTimestamp(value, 3);
+    }
+
+    private static Expression castToTimestamp(Expression value, int precision)
+    {
+        return new Cast(value, createTimestampType(precision));
+    }
+
+    // CAST(at_timezone(chain, zone) AS timestamp(3))
+    private static Expression wallClockChain(String zone)
+    {
+        return castToTimestamp(atTimeZone(chain(), zone));
     }
 
     private static Call division(Expression dividend, long divisor)

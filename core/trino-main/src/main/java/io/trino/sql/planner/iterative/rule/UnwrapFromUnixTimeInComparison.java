@@ -20,8 +20,11 @@ import io.airlift.slice.Slice;
 import io.trino.Session;
 import io.trino.metadata.Metadata;
 import io.trino.metadata.ResolvedFunction;
+import io.trino.spi.type.LongTimestamp;
 import io.trino.spi.type.LongTimestampWithTimeZone;
+import io.trino.spi.type.TimeZoneKey;
 import io.trino.spi.type.TimeZoneNotSupportedException;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.VarcharType;
 import io.trino.sql.PlannerContext;
@@ -40,6 +43,11 @@ import io.trino.sql.ir.optimizer.IrExpressionOptimizer;
 import io.trino.sql.planner.Symbol;
 import io.trino.sql.planner.SymbolAllocator;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.zone.ZoneOffsetTransition;
+import java.time.zone.ZoneRules;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
@@ -83,6 +91,17 @@ import static java.util.Objects.requireNonNull;
  * column by a positive constant, into an equivalent comparison directly on the column, so that
  * predicate pushdown and file pruning apply.
  * <p>
+ * The chain can also be compared as a wall clock rather than as an instant. {@code CAST(x AS timestamp(p))}
+ * renders the instant {@code x} in the zone {@code x} carries, which is the zone of an enclosing
+ * {@code x AT TIME ZONE <constant zone>} or the zone {@code from_unixtime} itself attaches. The ordering
+ * comparisons of such a wall clock are inverted back to instant bounds. This is only attempted for
+ * {@code Asia/Shanghai} and fixed +08:00 zones such as {@code GMT+8}: their offset never changes, so the
+ * wall clock is a pure shift of the instant and the inversion is a mathematical identity — no daylight
+ * saving transition can make a wall clock occur twice or not at all. Shanghai ran daylight saving time
+ * 1986-1991, so thresholds whose ambiguity window reaches back into that era are abandoned. Zones with
+ * transitions (a fall-back renders the same wall clock twice, so the satisfying rows are not a single
+ * range of instants) are deliberately left alone, as are equality, IN and the nanosecond chain.
+ * <p>
  * Semantics relied upon (DateTimeFunctions): {@code from_unixtime(x)} produces epoch millis
  * {@code Math.round(x * 1000)} — rounding half up — while {@code from_unixtime_nanos(n)} is the
  * identity in epoch nanos. Bigint division truncates toward zero. The zone argument only relabels
@@ -110,6 +129,31 @@ public class UnwrapFromUnixTimeInComparison
 {
     private static final BigDecimal THOUSAND = BigDecimal.valueOf(1000);
     private static final BigDecimal HALF = new BigDecimal("0.5");
+
+    private static final int MILLIS_PRECISION = 3;
+    // the zones for which wall clock comparisons are inverted: Asia/Shanghai has had a fixed +08:00 offset
+    // since September 1991, and fixed-offset +08:00 zones (GMT+8 and friends) render the same wall clock for
+    // every instant, so in both cases the wall clock is a pure shift of the instant and the inversion is exact
+    private static final TimeZoneKey WALL_CLOCK_ZONE = getTimeZoneKey("Asia/Shanghai");
+    private static final ZoneOffset WALL_CLOCK_OFFSET = ZoneOffset.ofHours(8);
+    // every zone offset is bounded by ±18h (TimeZoneKey validates that bound), so a wall clock comparison is
+    // decided outside [threshold - 24h, threshold + 24h]
+    private static final long AMBIGUITY_WINDOW_MILLIS = Duration.ofHours(24).toMillis();
+    // Asia/Shanghai ran daylight saving time 1986-1991; this is the instant of its last offset change, after
+    // which the offset stays fixed forever. A threshold is only inverted when its whole ambiguity window lies
+    // in the fixed-offset era (bound - 24h >= lastChange), because before it the wall clock is not a pure
+    // shift of the instant
+    private static final BigInteger SHANGHAI_MONOTONE_BOUND =
+            BigInteger.valueOf(lastOffsetChange(WALL_CLOCK_ZONE)).add(BigInteger.valueOf(AMBIGUITY_WINDOW_MILLIS));
+
+    private static long lastOffsetChange(TimeZoneKey zone)
+    {
+        List<ZoneOffsetTransition> transitions = zone.getZoneId().getRules().getTransitions();
+        if (transitions.isEmpty()) {
+            return Long.MIN_VALUE;
+        }
+        return transitions.get(transitions.size() - 1).getInstant().toEpochMilli();
+    }
 
     public UnwrapFromUnixTimeInComparison(PlannerContext plannerContext)
     {
@@ -226,6 +270,26 @@ public class UnwrapFromUnixTimeInComparison
     private record NanosChain(Reference leaf)
             implements Chain {}
 
+    /**
+     * Where a comparison takes place: on the instants of a timestamp with time zone value, or on the wall clock
+     * that value is rendered as in a given zone.
+     */
+    private sealed interface Domain
+    {
+        /** compared as timestamp(p) with time zone: instants */
+        record Tz() implements Domain {}
+
+        /** compared as timestamp(p): the chain's instant rendered as a wall clock in the zone */
+        record Local(TimeZoneKey zone) implements Domain {}
+    }
+
+    private record Match(Chain chain, Domain domain) {}
+
+    /** a recognized chain together with its rendering zone (null for the nanos chain without AT TIME ZONE) */
+    private record TzChain(Chain chain, TimeZoneKey zone) {}
+
+    private record LocalChain(Chain chain, TimeZoneKey zone) {}
+
     private static class Visitor
             extends io.trino.sql.ir.ExpressionRewriter<Void>
     {
@@ -263,15 +327,15 @@ public class UnwrapFromUnixTimeInComparison
         public Expression rewriteIn(In node, Void context, ExpressionTreeRewriter<Void> treeRewriter)
         {
             In in = treeRewriter.defaultRewrite(node, null);
-            Optional<Chain> chain = matchChain(in.value());
-            if (chain.isEmpty()) {
+            Optional<Match> match = matchChain(in.value());
+            if (match.isEmpty()) {
                 return in;
             }
             // unwrap only if every element can be inverted as an equality
             List<Expression> equalities = new ArrayList<>(in.valueList().size());
             for (Expression element : in.valueList()) {
-                Optional<Expression> equality = foldToTimestampConstant(element)
-                        .flatMap(constant -> invert(chain.get(), EQUAL, constant));
+                Optional<Expression> equality = foldToTimestampConstant(element, match.get().domain())
+                        .flatMap(constant -> invertInDomain(match.get(), EQUAL, constant));
                 if (equality.isEmpty()) {
                     return in;
                 }
@@ -286,7 +350,7 @@ public class UnwrapFromUnixTimeInComparison
         public Expression rewriteLet(Let node, Void context, ExpressionTreeRewriter<Void> treeRewriter)
         {
             Let let = treeRewriter.defaultRewrite(node, null);
-            Optional<Chain> chain = matchChain(let.value());
+            Optional<Match> chain = matchChain(let.value());
             if (chain.isEmpty()) {
                 return let;
             }
@@ -307,7 +371,7 @@ public class UnwrapFromUnixTimeInComparison
             return and(rewritten);
         }
 
-        private Optional<Expression> invertBoundComparison(Chain chain, Symbol bound, Comparison comparison)
+        private Optional<Expression> invertBoundComparison(Match match, Symbol bound, Comparison comparison)
         {
             boolean leftIsBound = comparison.left() instanceof Reference left && left.name().equals(bound.name());
             boolean rightIsBound = comparison.right() instanceof Reference right && right.name().equals(bound.name());
@@ -316,39 +380,140 @@ public class UnwrapFromUnixTimeInComparison
             }
             ComparisonOperator operator = rightIsBound ? comparison.operator().flip() : comparison.operator();
             Expression constantSide = rightIsBound ? comparison.left() : comparison.right();
-            return foldToTimestampConstant(constantSide)
-                    .flatMap(constant -> invert(chain, operator, constant));
+            return foldToTimestampConstant(constantSide, match.domain())
+                    .flatMap(constant -> invertInDomain(match, operator, constant));
         }
 
         private Optional<Expression> tryUnwrap(ComparisonOperator operator, Expression chainSide, Expression constantSide)
         {
             return matchChain(chainSide)
-                    .flatMap(chain -> foldToTimestampConstant(constantSide)
-                            .flatMap(constant -> invert(chain, operator, constant)));
+                    .flatMap(match -> foldToTimestampConstant(constantSide, match.domain())
+                            .flatMap(constant -> invertInDomain(match, operator, constant)));
         }
 
-        private Optional<Constant> foldToTimestampConstant(Expression expression)
+        // The constant is compared with the chain's output, so its type must match the comparison domain: an
+        // instant for the instant domain, a wall clock for the wall clock domain.
+        private Optional<Constant> foldToTimestampConstant(Expression expression, Domain domain)
         {
             Expression folded = optimizer.process(expression, session, symbolAllocator, ImmutableMap.of()).orElse(expression);
-            if (folded instanceof Constant constant &&
-                    constant.type() instanceof TimestampWithTimeZoneType &&
-                    constant.value() != null) {
-                return Optional.of(constant);
+            if (!(folded instanceof Constant constant) || constant.value() == null) {
+                return Optional.empty();
+            }
+            boolean matches = switch (domain) {
+                case Domain.Tz() -> constant.type() instanceof TimestampWithTimeZoneType;
+                case Domain.Local ignored -> constant.type() instanceof TimestampType;
+            };
+            return matches ? Optional.of(constant) : Optional.empty();
+        }
+
+        private Optional<Expression> invertInDomain(Match match, ComparisonOperator operator, Constant constant)
+        {
+            return switch (match.domain()) {
+                case Domain.Tz() -> invert(match.chain(), operator, constant);
+                case Domain.Local(TimeZoneKey zone) -> invertLocal(match.chain(), operator, constant, zone);
+            };
+        }
+
+        // A comparison is made on instants (timestamp with time zone) or on a wall clock (timestamp). Try the
+        // wall clock form first: it is the only one whose top-level expression is a zoneless cast.
+        private Optional<Match> matchChain(Expression expression)
+        {
+            Optional<Match> local = matchLocalChain(expression);
+            if (local.isPresent()) {
+                return local;
+            }
+            return matchTzChain(expression).map(tz -> new Match(tz.chain(), new Domain.Tz()));
+        }
+
+        // CAST(... AS timestamp(p)): precision-only zoneless casts are peeled, and the cast of a timestamp with
+        // time zone value to a zoneless timestamp enters the wall clock domain. The zone the value is rendered in
+        // comes from the constant zone of an enclosing AT TIME ZONE, or from the zone from_unixtime attaches.
+        private Optional<Match> matchLocalChain(Expression expression)
+        {
+            Expression current = expression;
+            while (current instanceof Cast cast && cast.type() instanceof TimestampType target) {
+                if (cast.expression().type() instanceof TimestampType source) {
+                    if (target.getPrecision() < source.getPrecision() || target.getPrecision() < MILLIS_PRECISION) {
+                        return Optional.empty();
+                    }
+                    current = cast.expression();
+                    continue;
+                }
+                if (cast.expression().type() instanceof TimestampWithTimeZoneType source) {
+                    if (target.getPrecision() < source.getPrecision() || target.getPrecision() < MILLIS_PRECISION) {
+                        return Optional.empty();
+                    }
+                    return localChain(cast.expression())
+                            .map(local -> new Match(local.chain(), new Domain.Local(local.zone())));
+                }
+                return Optional.empty();
             }
             return Optional.empty();
         }
 
-        // Peels precision-widening timestamp with time zone casts and recognizes the from_unixtime chain
-        private Optional<Chain> matchChain(Expression expression)
+        // The wall clock domain is only entered for Asia/Shanghai and fixed +08:00 zones (see isWallClockZone);
+        // every other zone is left untouched so that no daylight saving transition can invalidate the inversion.
+        private Optional<LocalChain> localChain(Expression expression)
+        {
+            // `value AT TIME ZONE <constant zone>` is instant preserving and only relabels the zone, so it decides
+            // the zone in which the value is rendered when it is cast to a zoneless timestamp
+            if (expression instanceof Call call
+                    && call.function().name().equals(builtinFunctionName("at_timezone"))
+                    && call.arguments().size() == 2
+                    && call.type() instanceof TimestampWithTimeZoneType) {
+                return constantZone(call.arguments().get(1))
+                        .filter(zone -> isWallClockZone(zone))
+                        .flatMap(zone -> matchTzChain(call.arguments().get(0))
+                                .map(tz -> new LocalChain(tz.chain(), zone)));
+            }
+            // otherwise the value is rendered in the zone from_unixtime attached to it; the nanosecond chain
+            // attaches the session zone as well but renders on a nanosecond grid, which this rule does not invert
+            return matchTzChain(expression)
+                    .filter(tz -> isWallClockZone(tz.zone()))
+                    .map(tz -> new LocalChain(tz.chain(), tz.zone()));
+        }
+
+        private static boolean isWallClockZone(TimeZoneKey zone)
+        {
+            if (zone == null) {
+                return false;
+            }
+            if (WALL_CLOCK_ZONE.equals(zone)) {
+                return true;
+            }
+            ZoneRules rules = zone.getZoneId().getRules();
+            return rules.isFixedOffset() && rules.getOffset(Instant.EPOCH).equals(WALL_CLOCK_OFFSET);
+        }
+
+        // Peels precision-widening timestamp with time zone casts, instant-preserving at_timezone calls with a
+        // constant zone, and recognizes the from_unixtime chain
+        private Optional<TzChain> matchTzChain(Expression expression)
         {
             Expression current = expression;
-            while (current instanceof Cast cast) {
-                if (!(cast.expression().type() instanceof TimestampWithTimeZoneType sourceType) ||
-                        !(cast.type() instanceof TimestampWithTimeZoneType targetType) ||
-                        targetType.getPrecision() <= sourceType.getPrecision()) {
-                    return Optional.empty();
+            TimeZoneKey renderingZone = null;
+            while (true) {
+                if (current instanceof Cast cast) {
+                    if (!(cast.expression().type() instanceof TimestampWithTimeZoneType sourceType) ||
+                            !(cast.type() instanceof TimestampWithTimeZoneType targetType) ||
+                            targetType.getPrecision() <= sourceType.getPrecision()) {
+                        return Optional.empty();
+                    }
+                    current = cast.expression();
+                    continue;
                 }
-                current = cast.expression();
+                // `value AT TIME ZONE <constant zone>` only relabels the zone of a timestamp with time zone and
+                // never changes the instant, so it is transparent to every comparison operator and can be dropped
+                // (same reasoning as UnwrapAtTimeZoneInComparison). Non-constant and invalid zones are left alone:
+                // a null zone makes the result null, and an invalid zone fails the query at runtime.
+                if (current instanceof Call call && isInstantPreservingAtTimeZone(call)) {
+                    // Only the outermost AT TIME ZONE determines rendering; precision widening preserves it.
+                    if (renderingZone == null) {
+                        renderingZone = constantZone(call.arguments().get(1)).orElseThrow();
+                    }
+                    current = call.arguments().get(0);
+                    continue;
+                }
+                break;
             }
             if (!(current instanceof Call call)) {
                 return Optional.empty();
@@ -357,45 +522,76 @@ public class UnwrapFromUnixTimeInComparison
                 if (!call.type().equals(TIMESTAMP_TZ_MILLIS) || call.arguments().isEmpty() || call.arguments().size() > 3) {
                     return Optional.empty();
                 }
-                if (!zoneArgumentsValid(call.arguments())) {
+                Optional<TimeZoneKey> zone = unixTimeZone(call.arguments());
+                if (zone.isEmpty()) {
                     return Optional.empty();
                 }
-                return matchMillisInput(call.arguments().get(0));
+                TimeZoneKey effectiveZone = renderingZone == null ? zone.get() : renderingZone;
+                return matchMillisInput(call.arguments().get(0)).map(chain -> new TzChain(chain, effectiveZone));
             }
             if (call.function().name().equals(builtinFunctionName("from_unixtime_nanos"))) {
                 if (!call.type().equals(TIMESTAMP_TZ_NANOS) || call.arguments().size() != 1) {
                     return Optional.empty();
                 }
                 if (call.arguments().get(0) instanceof Reference reference && reference.type().equals(BIGINT)) {
-                    return Optional.of(new NanosChain(reference));
+                    return Optional.of(new TzChain(new NanosChain(reference), renderingZone));
                 }
             }
             return Optional.empty();
         }
 
-        private boolean zoneArgumentsValid(List<Expression> arguments)
+        private static boolean isInstantPreservingAtTimeZone(Call call)
+        {
+            if (!call.function().name().equals(builtinFunctionName("at_timezone")) ||
+                    call.arguments().size() != 2 ||
+                    !(call.type() instanceof TimestampWithTimeZoneType) ||
+                    !call.arguments().get(0).type().equals(call.type())) {
+                return false;
+            }
+            // only a constant, valid zone can be dropped: a null zone makes the result null and an invalid
+            // zone fails the query at runtime, so dropping the call would change semantics
+            return constantZone(call.arguments().get(1)).isPresent();
+        }
+
+        private static Optional<TimeZoneKey> constantZone(Expression expression)
+        {
+            if (!(expression.type() instanceof VarcharType) ||
+                    !(expression instanceof Constant constant) ||
+                    !(constant.value() instanceof Slice slice)) {
+                return Optional.empty();
+            }
+            try {
+                return Optional.of(getTimeZoneKey(slice.toStringUtf8()));
+            }
+            catch (TimeZoneNotSupportedException | IllegalArgumentException e) {
+                return Optional.empty();
+            }
+        }
+
+        // The zone from_unixtime attaches to its result: the explicit zone/offset argument, or the session zone
+        // for the one-argument form. An unusable zone yields empty, so the original expression (and therefore the
+        // runtime error it raises) is preserved.
+        private Optional<TimeZoneKey> unixTimeZone(List<Expression> arguments)
         {
             try {
-                if (arguments.size() == 2) {
-                    if (!(arguments.get(1) instanceof Constant zoneConstant) ||
-                            !(zoneConstant.type() instanceof VarcharType) ||
-                            !(zoneConstant.value() instanceof Slice zone)) {
-                        return false;
-                    }
-                    getTimeZoneKey(zone.toStringUtf8());
+                if (arguments.size() == 1) {
+                    return Optional.of(session.getTimeZoneKey());
                 }
-                else if (arguments.size() == 3) {
+                if (arguments.size() == 2) {
+                    return constantZone(arguments.get(1));
+                }
+                if (arguments.size() == 3) {
                     if (!(arguments.get(1) instanceof Constant hours) || !(hours.value() instanceof Long) ||
                             !(arguments.get(2) instanceof Constant minutes) || !(minutes.value() instanceof Long)) {
-                        return false;
+                        return Optional.empty();
                     }
-                    getTimeZoneKeyForOffset(Math.addExact(Math.multiplyExact((Long) hours.value(), 60), (Long) minutes.value()));
+                    return Optional.of(getTimeZoneKeyForOffset(Math.addExact(Math.multiplyExact((Long) hours.value(), 60), (Long) minutes.value())));
                 }
-                return true;
+                return Optional.empty();
             }
             catch (IllegalArgumentException | ArithmeticException | TimeZoneNotSupportedException e) {
                 // preserve the original expression so that the runtime error still fires
-                return false;
+                return Optional.empty();
             }
         }
 
@@ -445,6 +641,133 @@ public class UnwrapFromUnixTimeInComparison
                 }
             }
             return Optional.empty();
+        }
+
+        // The chain's instant is rendered as a wall clock in the zone and the comparison is on the rendered
+        // value, so invert it back to a comparison on the instant and let the existing inversion map it onto the
+        // leaf column. Only the four ordering operators are supported: equality and IN would additionally have to
+        // reason about wall clocks that no instant renders to or that are rendered twice. The zone is always
+        // Asia/Shanghai or a fixed +08:00 zone (enforced when the wall clock domain is entered), whose fixed
+        // offset makes the wall clock a pure shift of the instant, so the inversion is a mathematical identity.
+        private Optional<Expression> invertLocal(Chain chain, ComparisonOperator operator, Constant constant, TimeZoneKey zone)
+        {
+            if (chain instanceof NanosChain) {
+                return Optional.empty();
+            }
+            Optional<BigDecimal> localMillis = exactLocalMillis(constant);
+            if (localMillis.isEmpty()) {
+                return Optional.empty();
+            }
+            BigDecimal millis = localMillis.get();
+            BigInteger bound;
+            ComparisonOperator instantOperator;
+            switch (operator) {
+                // wall >= c  <=>  wall >= ceil(c)  <=>  instant >= thresholdGE(ceil(c))
+                case GREATER_THAN_OR_EQUAL -> {
+                    bound = ceilToBigInteger(millis);
+                    instantOperator = GREATER_THAN_OR_EQUAL;
+                }
+                // wall < c  <=>  wall < ceil(c)  <=>  instant < thresholdGE(ceil(c))
+                case LESS_THAN -> {
+                    bound = ceilToBigInteger(millis);
+                    instantOperator = LESS_THAN;
+                }
+                // wall <= c  <=>  wall < floor(c) + 1  <=>  instant < thresholdGE(floor(c) + 1)
+                case LESS_THAN_OR_EQUAL -> {
+                    bound = floorToBigInteger(millis).add(BigInteger.ONE);
+                    instantOperator = LESS_THAN;
+                }
+                // wall > c  <=>  wall >= floor(c) + 1  <=>  instant >= thresholdGE(floor(c) + 1)
+                case GREATER_THAN -> {
+                    bound = floorToBigInteger(millis).add(BigInteger.ONE);
+                    instantOperator = GREATER_THAN_OR_EQUAL;
+                }
+                default -> {
+                    return Optional.empty();
+                }
+            }
+            if (!isWallClockZone(zone)) {
+                return Optional.empty();
+            }
+            // Asia/Shanghai only: the threshold's ambiguity window must lie entirely in the era after its
+            // last offset change (September 1991). Fixed +08:00 zones never changed offset and need no guard.
+            if (WALL_CLOCK_ZONE.equals(zone) && bound.compareTo(SHANGHAI_MONOTONE_BOUND) < 0) {
+                return Optional.empty();
+            }
+            return epochMillisAtOrAbove(zone, bound)
+                    .flatMap(instant -> invertMillis(chain, instantOperator, BigDecimal.valueOf(instant)));
+        }
+
+        // invert() for a threshold that already is an instant in epoch millis, bypassing the constant decoding
+        private Optional<Expression> invertMillis(Chain chain, ComparisonOperator operator, BigDecimal millis)
+        {
+            return switch (chain) {
+                case IntChain intChain -> invertInt(intChain, operator, millis);
+                case DoubleChain doubleChain -> invertDouble(doubleChain, operator, millis);
+                case NanosChain ignored -> Optional.empty();
+            };
+        }
+
+        // The wall clock of a timestamp constant, in epoch millis: both the short (precision <= 6) and the long
+        // representation hold epoch microseconds.
+        private static Optional<BigDecimal> exactLocalMillis(Constant constant)
+        {
+            if (!(constant.type() instanceof TimestampType type) || constant.value() == null) {
+                return Optional.empty();
+            }
+            if (type.isShort()) {
+                return Optional.of(BigDecimal.valueOf((Long) constant.value()).scaleByPowerOfTen(-3));
+            }
+            LongTimestamp timestamp = (LongTimestamp) constant.value();
+            return Optional.of(BigDecimal.valueOf(timestamp.getEpochMicros())
+                    .scaleByPowerOfTen(-3)
+                    .add(BigDecimal.valueOf(timestamp.getPicosOfMicro()).scaleByPowerOfTen(-9)));
+        }
+
+        // Smallest instant millis whose wall clock in the zone is at or after the millisecond grid point k, that
+        // is the smallest t with t + offset(t) >= k. The zone has a fixed offset, so the wall clock is monotone
+        // in the instant and a binary search over [k - 24h, k + 24h] finds it exactly; outside the window the
+        // comparison is decided because every zone offset is bounded by ±18h.
+        private static Optional<Long> epochMillisAtOrAbove(TimeZoneKey zone, BigInteger k)
+        {
+            long target;
+            try {
+                target = k.longValueExact();
+            }
+            catch (ArithmeticException e) {
+                return Optional.empty();
+            }
+            ZoneRules rules = zone.getZoneId().getRules();
+            try {
+                long low = Math.subtractExact(target, AMBIGUITY_WINDOW_MILLIS);
+                long high = Math.addExact(target, AMBIGUITY_WINDOW_MILLIS);
+                if (wallClockMillis(rules, high) < target) {
+                    return Optional.empty();
+                }
+                while (low < high) {
+                    long middle = low + Math.floorDiv(high - low, 2L);
+                    if (wallClockMillis(rules, middle) >= target) {
+                        high = middle;
+                    }
+                    else {
+                        low = middle + 1;
+                    }
+                }
+                return Optional.of(low);
+            }
+            catch (ArithmeticException e) {
+                return Optional.empty();
+            }
+        }
+
+        private static long wallClockMillis(ZoneRules rules, long epochMillis)
+        {
+            return Math.addExact(epochMillis, offsetMillis(rules, epochMillis));
+        }
+
+        private static long offsetMillis(ZoneRules rules, long epochMillis)
+        {
+            return rules.getOffset(Instant.ofEpochMilli(epochMillis)).getTotalSeconds() * 1000L;
         }
 
         private Optional<Expression> invert(Chain chain, ComparisonOperator operator, Constant constant)
