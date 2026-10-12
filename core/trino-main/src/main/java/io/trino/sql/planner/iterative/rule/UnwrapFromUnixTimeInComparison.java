@@ -42,15 +42,14 @@ import io.trino.sql.ir.Reference;
 import io.trino.sql.ir.optimizer.IrExpressionOptimizer;
 import io.trino.sql.planner.Symbol;
 import io.trino.sql.planner.SymbolAllocator;
+import io.trino.util.DateTimeZoneIndex;
+import org.joda.time.DateTimeZone;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.time.Duration;
-import java.time.Instant;
-import java.time.ZoneOffset;
 import java.time.zone.ZoneOffsetTransition;
-import java.time.zone.ZoneRules;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -135,9 +134,10 @@ public class UnwrapFromUnixTimeInComparison
     // since September 1991, and fixed-offset +08:00 zones (GMT+8 and friends) render the same wall clock for
     // every instant, so in both cases the wall clock is a pure shift of the instant and the inversion is exact
     private static final TimeZoneKey WALL_CLOCK_ZONE = getTimeZoneKey("Asia/Shanghai");
-    private static final ZoneOffset WALL_CLOCK_OFFSET = ZoneOffset.ofHours(8);
-    // every zone offset is bounded by ±18h (TimeZoneKey validates that bound), so a wall clock comparison is
-    // decided outside [threshold - 24h, threshold + 24h]
+    private static final long WALL_CLOCK_OFFSET_MILLIS = Duration.ofHours(8).toMillis();
+    // a wall clock comparison is decided outside [threshold - 24h, threshold + 24h]: the largest offset in the
+    // time zone database the runtime cast uses is below 16h (the historical LMT of Asia/Manila is -15:56:08),
+    // and fixed-offset zone keys are bounded by ±14h (TimeZoneKey.OFFSET_TIME_ZONE_MIN/MAX)
     private static final long AMBIGUITY_WINDOW_MILLIS = Duration.ofHours(24).toMillis();
     // Asia/Shanghai ran daylight saving time 1986-1991; this is the instant of its last offset change, after
     // which the offset stays fixed forever. A threshold is only inverted when its whole ambiguity window lies
@@ -146,6 +146,9 @@ public class UnwrapFromUnixTimeInComparison
     private static final BigInteger SHANGHAI_MONOTONE_BOUND =
             BigInteger.valueOf(lastOffsetChange(WALL_CLOCK_ZONE)).add(BigInteger.valueOf(AMBIGUITY_WINDOW_MILLIS));
 
+    // The era bound stays on java.time on purpose: Joda's transition lookup reports the last instant of the old
+    // offset, one millisecond before the transition instant java.time reports, so moving this guard would move
+    // the admission boundary by a millisecond. Only the bounds themselves must agree with the runtime cast.
     private static long lastOffsetChange(TimeZoneKey zone)
     {
         List<ZoneOffsetTransition> transitions = zone.getZoneId().getRules().getTransitions();
@@ -489,8 +492,8 @@ public class UnwrapFromUnixTimeInComparison
             if (WALL_CLOCK_ZONE.equals(zone)) {
                 return true;
             }
-            ZoneRules rules = zone.getZoneId().getRules();
-            return rules.isFixedOffset() && rules.getOffset(Instant.EPOCH).equals(WALL_CLOCK_OFFSET);
+            DateTimeZone dateTimeZone = DateTimeZoneIndex.getDateTimeZone(zone);
+            return dateTimeZone.isFixed() && dateTimeZone.getOffset(0) == WALL_CLOCK_OFFSET_MILLIS;
         }
 
         // Peels precision-widening timestamp with time zone casts, instant-preserving at_timezone calls with a
@@ -733,9 +736,10 @@ public class UnwrapFromUnixTimeInComparison
         }
 
         // Smallest instant millis whose wall clock in the zone is at or after the millisecond grid point k, that
-        // is the smallest t with t + offset(t) >= k. The zone has a fixed offset, so the wall clock is monotone
-        // in the instant and a binary search over [k - 24h, k + 24h] finds it exactly; outside the window the
-        // comparison is decided because every zone offset is bounded by ±18h.
+        // is the smallest t with t + offset(t) >= k, evaluated with the same time zone object the zoneless cast
+        // uses. The zone has a fixed offset, so the wall clock is monotone in the instant and a binary search
+        // over [k - 24h, k + 24h] finds it exactly; outside the window the comparison is decided because every
+        // offset in the time zone database is below 16h.
         private static Optional<Long> epochMillisAtOrAbove(TimeZoneKey zone, BigInteger k)
         {
             long target;
@@ -745,16 +749,16 @@ public class UnwrapFromUnixTimeInComparison
             catch (ArithmeticException e) {
                 return Optional.empty();
             }
-            ZoneRules rules = zone.getZoneId().getRules();
+            DateTimeZone dateTimeZone = DateTimeZoneIndex.getDateTimeZone(zone);
             try {
                 long low = Math.subtractExact(target, AMBIGUITY_WINDOW_MILLIS);
                 long high = Math.addExact(target, AMBIGUITY_WINDOW_MILLIS);
-                if (wallClockMillis(rules, high) < target) {
+                if (wallClockMillis(dateTimeZone, high) < target) {
                     return Optional.empty();
                 }
                 while (low < high) {
                     long middle = low + Math.floorDiv(high - low, 2L);
-                    if (wallClockMillis(rules, middle) >= target) {
+                    if (wallClockMillis(dateTimeZone, middle) >= target) {
                         high = middle;
                     }
                     else {
@@ -768,14 +772,9 @@ public class UnwrapFromUnixTimeInComparison
             }
         }
 
-        private static long wallClockMillis(ZoneRules rules, long epochMillis)
+        private static long wallClockMillis(DateTimeZone zone, long epochMillis)
         {
-            return Math.addExact(epochMillis, offsetMillis(rules, epochMillis));
-        }
-
-        private static long offsetMillis(ZoneRules rules, long epochMillis)
-        {
-            return rules.getOffset(Instant.ofEpochMilli(epochMillis)).getTotalSeconds() * 1000L;
+            return Math.addExact(epochMillis, zone.getOffset(epochMillis));
         }
 
         private Optional<Expression> invert(Chain chain, ComparisonOperator operator, Constant constant)
