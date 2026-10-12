@@ -49,7 +49,6 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.time.Duration;
-import java.time.zone.ZoneOffsetTransition;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -130,34 +129,10 @@ public class UnwrapFromUnixTimeInComparison
     private static final BigDecimal HALF = new BigDecimal("0.5");
 
     private static final int MILLIS_PRECISION = 3;
-    // the zones for which wall clock comparisons are inverted: Asia/Shanghai has had a fixed +08:00 offset
-    // since September 1991, and fixed-offset +08:00 zones (GMT+8 and friends) render the same wall clock for
-    // every instant, so in both cases the wall clock is a pure shift of the instant and the inversion is exact
-    private static final TimeZoneKey WALL_CLOCK_ZONE = getTimeZoneKey("Asia/Shanghai");
-    private static final long WALL_CLOCK_OFFSET_MILLIS = Duration.ofHours(8).toMillis();
     // a wall clock comparison is decided outside [threshold - 24h, threshold + 24h]: the largest offset in the
     // time zone database the runtime cast uses is below 16h (the historical LMT of Asia/Manila is -15:56:08),
     // and fixed-offset zone keys are bounded by ±14h (TimeZoneKey.OFFSET_TIME_ZONE_MIN/MAX)
     private static final long AMBIGUITY_WINDOW_MILLIS = Duration.ofHours(24).toMillis();
-    // Asia/Shanghai ran daylight saving time 1986-1991; this is the instant of its last offset change, after
-    // which the offset stays fixed forever. A threshold is only inverted when its whole ambiguity window lies
-    // in the fixed-offset era (bound - 24h >= lastChange), because before it the wall clock is not a pure
-    // shift of the instant
-    private static final BigInteger SHANGHAI_MONOTONE_BOUND =
-            BigInteger.valueOf(lastOffsetChange(WALL_CLOCK_ZONE)).add(BigInteger.valueOf(AMBIGUITY_WINDOW_MILLIS));
-
-    // The era bound stays on java.time on purpose: Joda's transition lookup reports the last instant of the old
-    // offset, one millisecond before the transition instant java.time reports, so moving this guard would move
-    // the admission boundary by a millisecond. Only the bounds themselves must agree with the runtime cast.
-    private static long lastOffsetChange(TimeZoneKey zone)
-    {
-        List<ZoneOffsetTransition> transitions = zone.getZoneId().getRules().getTransitions();
-        if (transitions.isEmpty()) {
-            return Long.MIN_VALUE;
-        }
-        return transitions.get(transitions.size() - 1).getInstant().toEpochMilli();
-    }
-
     public UnwrapFromUnixTimeInComparison(PlannerContext plannerContext)
     {
         super(createRewrite(plannerContext));
@@ -462,8 +437,8 @@ public class UnwrapFromUnixTimeInComparison
             return Optional.empty();
         }
 
-        // The wall clock domain is only entered for Asia/Shanghai and fixed +08:00 zones (see isWallClockZone);
-        // every other zone is left untouched so that no daylight saving transition can invalidate the inversion.
+        // Every constant rendering zone enters the wall clock domain: whether the inversion is valid is decided
+        // per threshold by the transition window check in epochMillisAtOrAbove.
         private Optional<LocalChain> localChain(Expression expression)
         {
             // `value AT TIME ZONE <constant zone>` is instant preserving and only relabels the zone, so it decides
@@ -473,27 +448,13 @@ public class UnwrapFromUnixTimeInComparison
                     && call.arguments().size() == 2
                     && call.type() instanceof TimestampWithTimeZoneType) {
                 return constantZone(call.arguments().get(1))
-                        .filter(zone -> isWallClockZone(zone))
                         .flatMap(zone -> matchTzChain(call.arguments().get(0))
                                 .map(tz -> new LocalChain(tz.chain(), zone)));
             }
             // otherwise the value is rendered in the zone from_unixtime attached to it; the nanosecond chain
             // attaches the session zone as well but renders on a nanosecond grid, which this rule does not invert
             return matchTzChain(expression)
-                    .filter(tz -> isWallClockZone(tz.zone()))
                     .map(tz -> new LocalChain(tz.chain(), tz.zone()));
-        }
-
-        private static boolean isWallClockZone(TimeZoneKey zone)
-        {
-            if (zone == null) {
-                return false;
-            }
-            if (WALL_CLOCK_ZONE.equals(zone)) {
-                return true;
-            }
-            DateTimeZone dateTimeZone = DateTimeZoneIndex.getDateTimeZone(zone);
-            return dateTimeZone.isFixed() && dateTimeZone.getOffset(0) == WALL_CLOCK_OFFSET_MILLIS;
         }
 
         // Peels precision-widening timestamp with time zone casts, instant-preserving at_timezone calls with a
@@ -657,9 +618,9 @@ public class UnwrapFromUnixTimeInComparison
         // The chain's instant is rendered as a wall clock in the zone and the comparison is on the rendered
         // value, so invert it back to a comparison on the instant and let the existing inversion map it onto the
         // leaf column. Only the four ordering operators are supported: equality and IN would additionally have to
-        // reason about wall clocks that no instant renders to or that are rendered twice. The zone is always
-        // Asia/Shanghai or a fixed +08:00 zone (enforced when the wall clock domain is entered), whose fixed
-        // offset makes the wall clock a pure shift of the instant, so the inversion is a mathematical identity.
+        // reason about wall clocks that no instant renders to or that are rendered twice. A threshold is inverted
+        // only when the wall clock is non-decreasing over its ambiguity window, which is what makes the preimage
+        // of the comparison a single half-line of instants.
         private Optional<Expression> invertLocal(Chain chain, ComparisonOperator operator, Constant constant, TimeZoneKey zone)
         {
             if (chain instanceof NanosChain) {
@@ -697,14 +658,6 @@ public class UnwrapFromUnixTimeInComparison
                     return Optional.empty();
                 }
             }
-            if (!isWallClockZone(zone)) {
-                return Optional.empty();
-            }
-            // Asia/Shanghai only: the threshold's ambiguity window must lie entirely in the era after its
-            // last offset change (September 1991). Fixed +08:00 zones never changed offset and need no guard.
-            if (WALL_CLOCK_ZONE.equals(zone) && bound.compareTo(SHANGHAI_MONOTONE_BOUND) < 0) {
-                return Optional.empty();
-            }
             return epochMillisAtOrAbove(zone, bound)
                     .flatMap(instant -> invertMillis(chain, instantOperator, BigDecimal.valueOf(instant)));
         }
@@ -737,9 +690,10 @@ public class UnwrapFromUnixTimeInComparison
 
         // Smallest instant millis whose wall clock in the zone is at or after the millisecond grid point k, that
         // is the smallest t with t + offset(t) >= k, evaluated with the same time zone object the zoneless cast
-        // uses. The zone has a fixed offset, so the wall clock is monotone in the instant and a binary search
-        // over [k - 24h, k + 24h] finds it exactly; outside the window the comparison is decided because every
-        // offset in the time zone database is below 16h.
+        // uses. The search runs over [k - 24h, k + 24h]: outside it the comparison is decided because every offset
+        // in the time zone database is below 16h, and inside it the wall clock is non-decreasing when no fall-back
+        // transition falls strictly inside the window, which is what wallClockMonotone checks. A spring-forward gap
+        // keeps the wall clock non-decreasing, so the binary search still finds the first instant at or above k.
         private static Optional<Long> epochMillisAtOrAbove(TimeZoneKey zone, BigInteger k)
         {
             long target;
@@ -753,6 +707,9 @@ public class UnwrapFromUnixTimeInComparison
             try {
                 long low = Math.subtractExact(target, AMBIGUITY_WINDOW_MILLIS);
                 long high = Math.addExact(target, AMBIGUITY_WINDOW_MILLIS);
+                if (!wallClockMonotone(dateTimeZone, low, high)) {
+                    return Optional.empty();
+                }
                 if (wallClockMillis(dateTimeZone, high) < target) {
                     return Optional.empty();
                 }
@@ -769,6 +726,33 @@ public class UnwrapFromUnixTimeInComparison
             }
             catch (ArithmeticException e) {
                 return Optional.empty();
+            }
+        }
+
+        // True when the wall clock is non-decreasing over [low, high], that is when no fall-back transition falls
+        // strictly inside the window. Transitions exactly at an endpoint are harmless: the 24h window itself
+        // decides the comparison on either side of the endpoint, and a spring-forward only jumps forwards.
+        private static boolean wallClockMonotone(DateTimeZone zone, long low, long high)
+        {
+            long instant = low;
+            while (true) {
+                long transition = zone.nextTransition(instant);
+                if (transition == instant) {
+                    // documented contract of the runtime API: the instant itself means no later transition exists
+                    return true;
+                }
+                if (transition < instant) {
+                    // the runtime API promises strict progress; anything else cannot be classified
+                    return false;
+                }
+                if (transition >= high) {
+                    // a transition at the end of the window is decided by the window itself
+                    return true;
+                }
+                if (zone.getOffset(transition) < zone.getOffset(transition - 1)) {
+                    return false;
+                }
+                instant = transition;
             }
         }
 
