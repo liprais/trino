@@ -133,6 +133,7 @@ public class UnwrapFromUnixTimeInComparison
     // time zone database the runtime cast uses is below 16h (the historical LMT of Asia/Manila is -15:56:08),
     // and fixed-offset zone keys are bounded by ±14h (TimeZoneKey.OFFSET_TIME_ZONE_MIN/MAX)
     private static final long AMBIGUITY_WINDOW_MILLIS = Duration.ofHours(24).toMillis();
+
     public UnwrapFromUnixTimeInComparison(PlannerContext plannerContext)
     {
         super(createRewrite(plannerContext));
