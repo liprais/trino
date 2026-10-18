@@ -101,9 +101,10 @@ import static java.util.Objects.requireNonNull;
  * transitions (a fall-back renders the same wall clock twice, so the satisfying rows are not a single
  * range of instants) are deliberately left alone, as are equality, IN and the nanosecond chain.
  * <p>
- * Semantics relied upon (DateTimeFunctions): {@code from_unixtime(x)} produces epoch millis
- * {@code Math.round(x * 1000)} — rounding half up — while {@code from_unixtime_nanos(n)} is the
- * identity in epoch nanos. Bigint division truncates toward zero. The zone argument only relabels
+ * Semantics relied upon (DateTimeFunctions): {@code from_unixtime(x)} produces epoch millis by rounding
+ * {@code x * 1000} half away from zero, treating a value as a tie when it is the double nearest a half
+ * millisecond (see {@code DateTimeFunctions.unixTimeToEpochMillis}); {@code from_unixtime_nanos(n)} is
+ * the identity in epoch nanos. Bigint division truncates toward zero. The zone argument only relabels
  * the instant and never affects comparison, but it is still validated so that invalid-zone errors
  * and NULL-zone NULL semantics are preserved.
  * <p>
@@ -112,9 +113,9 @@ import static java.util.Objects.requireNonNull;
  * <li>Inputs outside the representable timestamp range fail with INVALID_FUNCTION_ARGUMENT in the
  * original expression, while the rewritten comparison returns a boolean (row kept or excluded).
  * <li>For double chains the analytic real-number threshold is only a guess: every boundary is adjusted
- * against the actual floating point semantics (division, multiplication, {@code Math.round}) by direct
- * evaluation, so the rewrite is exact by construction.
- * <li>For a NaN input on a double chain, {@code Math.round(NaN)} yields epoch 0 in the original
+ * against the actual floating point semantics (division, multiplication, and from_unixtime's rounding)
+ * by direct evaluation, so the rewrite is exact by construction.
+ * <li>For a NaN input on a double chain, {@code from_unixtime(NaN)} yields epoch 0 in the original
  * expression; the rewrite therefore adds an explicit {@code is_nan} disjunct whenever millis 0
  * satisfies the comparison, keeping the rewrite exact for NaN as well.
  * </ul>
@@ -257,8 +258,8 @@ public class UnwrapFromUnixTimeInComparison
             implements Chain {}
 
     /**
-     * f(x) = round(1000 * x / divisor), divisor &gt; 0. Leaf may be BIGINT (integer tightening
-     * applies) or DOUBLE.
+     * f(x) = from_unixtime(x / divisor) in epoch millis, divisor &gt; 0. Leaf may be BIGINT (integer
+     * tightening applies) or DOUBLE.
      */
     private record DoubleChain(Reference leaf, BigDecimal divisor, boolean leafIsInteger)
             implements Chain {}
@@ -928,10 +929,11 @@ public class UnwrapFromUnixTimeInComparison
                 }
             }
             // The exact real-arithmetic thresholds t = d*(k∓0.5)/1000 are only an initial guess: the actual
-            // computation is step-by-step IEEE 754 (division, multiplication, then Math.round), and double
-            // rounding can shift the outcome at half-millis boundaries. So each threshold is adjusted against
-            // the real floating-point semantics by construction: thresholdGE(k) is the smallest leaf value
-            // whose chain evaluates to >= k, verified by direct evaluation. Monotonicity makes this exact.
+            // computation is step-by-step IEEE 754 (division, multiplication, then from_unixtime's rounding),
+            // and double rounding can shift the outcome at half-millis boundaries. So each threshold is
+            // adjusted against the real floating-point semantics by construction: thresholdGE(k) is the
+            // smallest leaf value whose chain evaluates to >= k, verified by direct evaluation. Monotonicity
+            // makes this exact.
             Reference leaf = chain.leaf();
             if (chain.leafIsInteger()) {
                 Optional<Long> bLow = intThresholdGE(chain, k);
@@ -973,7 +975,7 @@ public class UnwrapFromUnixTimeInComparison
                 }
                 default -> Optional.empty();
             };
-            // NaN: the original chain maps NaN to epoch millis 0 (Math.round(NaN) = 0), while every
+            // NaN: the original chain maps NaN to epoch millis 0 (from_unixtime(NaN) = 0), while every
             // rewritten double comparison is false for NaN. When millis 0 satisfies the comparison,
             // keep NaN rows via an explicit is_nan disjunct so the rewrite is exact.
             if (result.isPresent() && nanSatisfies(gridOperator, k)) {
@@ -999,10 +1001,36 @@ public class UnwrapFromUnixTimeInComparison
             return new Call(isNan, ImmutableList.of(leaf));
         }
 
-        // the chain's millis output evaluated with the actual floating point operations the engine performs
+        // the chain's millis output evaluated with the actual floating point operations the engine performs,
+        // including from_unixtime's half-away-from-zero rounding of a half millisecond
         private long evalChainMillis(DoubleChain chain, double leafValue)
         {
-            return Math.round(leafValue / chain.divisor().doubleValue() * 1000);
+            return unixTimeToEpochMillis(leafValue / chain.divisor().doubleValue());
+        }
+
+        // Mirrors DateTimeFunctions.unixTimeToEpochMillis: round half away from zero, treating unixTime as a
+        // tie when it is the double nearest a half millisecond. A negative exact tie therefore rounds down
+        // (-0.0625 s is -63 ms, not -62 ms), unlike Math.round. This must stay in sync with the engine:
+        // the adjusted thresholds are verified through this evaluator, so a divergence silently turns the
+        // rewrite into a different predicate at the tie values.
+        private static long unixTimeToEpochMillis(double unixTime)
+        {
+            double millis = unixTime * 1000;
+            if (Math.abs(millis) >= 0x1p52) {
+                // Integral and too large to pack; the saturating cast keeps it so
+                return (long) millis;
+            }
+            double floor = Math.floor(millis);
+            double fraction = millis - floor;
+            if (Math.abs(fraction - 0.5) > 2 * Math.ulp(millis)) {
+                return Math.round(millis);
+            }
+            long lowerMillis = (long) floor;
+            double halfMillisecond = (2 * lowerMillis + 1) / 2000.0;
+            if (unixTime > halfMillisecond || (unixTime == halfMillisecond && unixTime > 0)) {
+                return lowerMillis + 1;
+            }
+            return lowerMillis;
         }
 
         // smallest bigint n whose chain output is >= k, found by adjusting the analytic guess against
