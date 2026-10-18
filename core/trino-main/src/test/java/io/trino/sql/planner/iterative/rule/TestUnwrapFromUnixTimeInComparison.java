@@ -40,9 +40,9 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.time.zone.ZoneOffsetTransition;
 import java.time.zone.ZoneRules;
-import java.time.ZonedDateTime;
 import java.util.List;
 
 import static io.airlift.slice.Slices.utf8Slice;
@@ -73,13 +73,13 @@ import static io.trino.sql.ir.Logical.Operator.AND;
 import static io.trino.sql.ir.Logical.Operator.OR;
 import static io.trino.sql.ir.TestingIr.between;
 import static io.trino.sql.ir.TestingIr.comparison;
+import static io.trino.sql.planner.TestingSymbolAllocator.emptySymbolAllocator;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.anyTree;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.filter;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.output;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.tableScan;
 import static io.trino.sql.planner.iterative.rule.UnwrapFromUnixTimeInComparison.adjustDoubleThresholdGE;
 import static io.trino.sql.planner.iterative.rule.UnwrapFromUnixTimeInComparison.adjustIntThresholdGE;
-import static io.trino.sql.planner.TestingSymbolAllocator.emptySymbolAllocator;
 import static io.trino.sql.planner.iterative.rule.UnwrapFromUnixTimeInComparison.unwrapFromUnixTime;
 import static io.trino.testing.TestingSession.testSessionBuilder;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -183,17 +183,20 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testOtherDivisorsAndNoDivision()
     {
         // epoch seconds column, no division: from_unixtime(CAST(n AS double)) >= T(1s) → n >= 1
-        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
+        assertThat(unwrap(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(N, DOUBLE))),
                 tzConstant(3, 1000, "UTC"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 1L)));
         // other integer divisor: n / 60 >= T(1s) → q >= 1 → n >= 60
-        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
+        assertThat(unwrap(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(division(N, 60), DOUBLE))),
                 tzConstant(3, 1000, "UTC"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 60L)));
         // negative k with other divisor: n / 60 >= T(-1s) → q >= -1 → n >= -60 - 60 + 1 = -119
-        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
+        assertThat(unwrap(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(division(N, 60), DOUBLE))),
                 tzConstant(3, -1000, "UTC"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, -119L)));
@@ -214,7 +217,8 @@ public class TestUnwrapFromUnixTimeInComparison
 
         // double column: sweep the half-millis boundary including adjacent doubles
         Expression doubleCol = widenedDoubleChain();
-        Constant t62 = new Constant(TIMESTAMP_TZ_MICROS,
+        Constant t62 = new Constant(
+                TIMESTAMP_TZ_MICROS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(62, 0, getTimeZoneKey("UTC")));
         for (ComparisonOperator op : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN)) {
             Expression orig = comparison(op, doubleCol, t62);
@@ -260,8 +264,10 @@ public class TestUnwrapFromUnixTimeInComparison
         // NULL, non-constant and invalid zones keep the original call so that NULL and error semantics survive
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, atTimeZone(chain(), (String) null), tzConstant(3, 1000, "UTC")));
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, atTimeZone(chain(), "Not/AZone"), tzConstant(3, 1000, "UTC")));
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
-                atTimeZone(chain(), new Reference(createVarcharType(3), "zone")), tzConstant(3, 1000, "UTC")));
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
+                atTimeZone(chain(), new Reference(createVarcharType(3), "zone")),
+                tzConstant(3, 1000, "UTC")));
     }
 
     @Test
@@ -282,8 +288,10 @@ public class TestUnwrapFromUnixTimeInComparison
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant + 1000)));
 
         // a precision-only widening cast on the wall clock side is peeled
-        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
-                castToTimestamp(wallClockChain("Asia/Shanghai"), 6), localTimestamp(6, "2026-09-01 00:00:00.000000"))))
+        assertThat(unwrap(comparison(
+                GREATER_THAN_OR_EQUAL,
+                castToTimestamp(wallClockChain("Asia/Shanghai"), 6),
+                localTimestamp(6, "2026-09-01 00:00:00.000000"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant)));
 
         for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
@@ -302,7 +310,8 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testWallClockDomainWideningPreservesRejectedZone()
     {
         for (int precision : List.of(6, 9, 12)) {
-            Expression value = castToTimestamp(new Cast(atTimeZone(chain("Asia/Shanghai"), "UTC"),
+            Expression value = castToTimestamp(new Cast(
+                    atTimeZone(chain("Asia/Shanghai"), "UTC"),
                     createTimestampWithTimeZoneType(precision)), precision);
             Constant boundary = localTimestamp(precision, "2026-09-01 00:00:00." + "0".repeat(precision));
             for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
@@ -330,9 +339,11 @@ public class TestUnwrapFromUnixTimeInComparison
                     Expression original = comparison(operator, value, boundary);
                     Expression rewritten = unwrap(original);
                     assertThat(rewritten).isEqualTo(unwrap(comparison(operator, castToTimestamp(chain(zone), precision), boundary)));
-                    for (Long n : new Long[] {METABASE_BOUNDARY_K * 1000 - 1, METABASE_BOUNDARY_K * 1000,
+                    for (Long n : new Long[] {
+                            METABASE_BOUNDARY_K * 1000 - 1, METABASE_BOUNDARY_K * 1000,
                             METABASE_BOUNDARY_K * 1000 + 1, METABASE_BOUNDARY_K * 1000 + 999,
-                            METABASE_BOUNDARY_K * 1000 + 1000, METABASE_BOUNDARY_K * 1000 + 28_800_000, null}) {
+                            METABASE_BOUNDARY_K * 1000 + 1000, METABASE_BOUNDARY_K * 1000 + 28_800_000, null,
+                    }) {
                         assertThat(evaluate(rewritten, n))
                                 .as("precision %s, zone %s, operator %s, n=%s", precision, zone, operator, n)
                                 .isEqualTo(evaluate(original, n));
@@ -346,8 +357,10 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testWallClockDomainWideningPreservesInvalidZoneSemantics()
     {
         Constant boundary = localTimestamp(6, "2026-09-01 00:00:00");
-        for (Expression invalidZone : List.of(new Constant(createVarcharType(1), null),
-                new Constant(createVarcharType(9), utf8Slice("Not/AZone")), new Reference(createVarcharType(13), "zone"))) {
+        for (Expression invalidZone : List.of(
+                new Constant(createVarcharType(1), null),
+                new Constant(createVarcharType(9), utf8Slice("Not/AZone")),
+                new Reference(createVarcharType(13), "zone"))) {
             Expression inner = atTimeZone(chain("Asia/Shanghai"), invalidZone);
             Expression widened = new Cast(inner, TIMESTAMP_TZ_MICROS);
             Expression original = comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(widened, 6), boundary);
@@ -445,8 +458,10 @@ public class TestUnwrapFromUnixTimeInComparison
             Expression original = comparison(operator, castToTimestamp(chain("GMT+8")), boundary);
             Expression rewritten = unwrap(original);
             assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
-            for (long n : new long[] {instant - 2500, instant - 1500, instant - 1001, instant - 1000, instant - 999,
-                    instant - 500, instant - 1, instant, instant + 1, instant + 500, instant + 999, instant + 1000, instant + 1500}) {
+            for (long n : new long[] {
+                    instant - 2500, instant - 1500, instant - 1001, instant - 1000, instant - 999,
+                    instant - 500, instant - 1, instant, instant + 1, instant + 500, instant + 999, instant + 1000, instant + 1500,
+            }) {
                 assertThat(evaluate(rewritten, n))
                         .as("operator %s, n=%s", operator, n)
                         .isEqualTo(evaluate(original, n));
@@ -526,12 +541,15 @@ public class TestUnwrapFromUnixTimeInComparison
         assertUnchanged(new In(chain, ImmutableList.of(boundary)));
 
         // non-constant zone
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
-                castToTimestamp(atTimeZone(chain(), new Reference(createVarcharType(3), "zone"))), boundary));
-
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
+                castToTimestamp(atTimeZone(chain(), new Reference(createVarcharType(3), "zone"))),
+                boundary));
 
         // the nanosecond chain renders on a nanosecond grid
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(nanosChain(), 9),
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
+                castToTimestamp(nanosChain(), 9),
                 new Constant(createTimestampType(9), DateTimes.parseTimestamp(9, "2026-09-01 00:00:00.000000000"))));
     }
 
@@ -561,8 +579,10 @@ public class TestUnwrapFromUnixTimeInComparison
             Expression original = comparison(operator, boundary, wallClock);
             Expression rewritten = unwrap(original);
             assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
-            for (long n : new long[] {instant - 1000, instant - 1, instant, instant + 1, instant + 999,
-                    instant + 1000, instant + 1001, instant + 2000}) {
+            for (long n : new long[] {
+                    instant - 1000, instant - 1, instant, instant + 1, instant + 999,
+                    instant + 1000, instant + 1001, instant + 2000,
+            }) {
                 assertThat(evaluate(rewritten, n))
                         .as("operator %s, n=%s", operator, n)
                         .isEqualTo(evaluate(original, n));
@@ -590,8 +610,10 @@ public class TestUnwrapFromUnixTimeInComparison
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, castToTimestamp(castToTimestamp(wallClock, 6), 3), boundary));
 
         // widening a zoneless timestamp is lossless and only peeled
-        assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL,
-                castToTimestamp(castToTimestamp(wallClock, 6), 9), localTimestamp(9, "2026-09-01 00:00:00.000000000"))))
+        assertThat(unwrap(comparison(
+                GREATER_THAN_OR_EQUAL,
+                castToTimestamp(castToTimestamp(wallClock, 6), 9),
+                localTimestamp(9, "2026-09-01 00:00:00.000000000"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, instant)));
     }
 
@@ -613,8 +635,10 @@ public class TestUnwrapFromUnixTimeInComparison
                 comparison(LESS_THAN, N, new Constant(BIGINT, highInstant + 1000)))));
 
         // inclusive upper bound: the whole final second of the wall clock satisfies it
-        for (Long n : new Long[] {lowInstant - 1000, lowInstant - 1, lowInstant, lowInstant + 1,
-                highInstant - 1, highInstant, highInstant + 999, highInstant + 1000, highInstant + 1001, null}) {
+        for (Long n : new Long[] {
+                lowInstant - 1000, lowInstant - 1, lowInstant, lowInstant + 1,
+                highInstant - 1, highInstant, highInstant + 999, highInstant + 1000, highInstant + 1001, null,
+        }) {
             assertThat(evaluate(rewritten, n)).as("n=%s", n).isEqualTo(evaluate(letForm, n));
         }
     }
@@ -672,7 +696,8 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testFromUnixtimeNanos()
     {
         // identity in epoch nanos: T = 1s + 0.5ms → 1_000_500_000 nanos
-        Constant t = new Constant(TIMESTAMP_TZ_NANOS,
+        Constant t = new Constant(
+                TIMESTAMP_TZ_NANOS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(1000, 500_000_000, getTimeZoneKey("UTC")));
         assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, nanosChain(), t)))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, 1_000_500_000L)));
@@ -681,7 +706,8 @@ public class TestUnwrapFromUnixTimeInComparison
 
         // sub-nanosecond constant: a legal value needs p12 (1ps is below p9 resolution), and the p9 chain
         // is widened to p12 by the comparison's type coercion
-        Constant t12 = new Constant(createTimestampWithTimeZoneType(12),
+        Constant t12 = new Constant(
+                createTimestampWithTimeZoneType(12),
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(1000, 500_000_001, getTimeZoneKey("UTC")));
         Expression widenedNanos = new Cast(nanosChain(), createTimestampWithTimeZoneType(12));
         assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, widenedNanos, t12)))
@@ -754,7 +780,8 @@ public class TestUnwrapFromUnixTimeInComparison
         assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, widenedTo(createTimestampWithTimeZoneType(12)), tzConstant(12, -1000, "UTC"))))
                 .isEqualTo(comparison(GREATER_THAN_OR_EQUAL, N, new Constant(BIGINT, -1999L)));
         // fractional constant in long representation with 1ps beyond the milli: legal only at p12
-        Constant t12 = new Constant(createTimestampWithTimeZoneType(12),
+        Constant t12 = new Constant(
+                createTimestampWithTimeZoneType(12),
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(1500, 1, getTimeZoneKey("UTC")));
         // m = 1500ms + 1ps → q >= ceil(m/1000) = 2 → n >= 2000
         assertThat(unwrap(comparison(GREATER_THAN_OR_EQUAL, widenedTo(createTimestampWithTimeZoneType(12)), t12)))
@@ -766,7 +793,8 @@ public class TestUnwrapFromUnixTimeInComparison
     {
         // from_unixtime output is integer millis; T = 0.5ms must snap to 1ms before inversion
         // (correctness review §3 counterexample: x = 0.0002 must be excluded by >=)
-        Constant t = new Constant(TIMESTAMP_TZ_MICROS,
+        Constant t = new Constant(
+                TIMESTAMP_TZ_MICROS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(0, 500_000_000, getTimeZoneKey("UTC")));
         Expression doubleChain = widenedDoubleChain();
         for (ComparisonOperator op : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, EQUAL)) {
@@ -785,7 +813,8 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testSpecialDoubleInputs()
     {
         Expression doubleChain = widenedDoubleChain();
-        Constant epoch0 = new Constant(TIMESTAMP_TZ_MICROS,
+        Constant epoch0 = new Constant(
+                TIMESTAMP_TZ_MICROS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(0, 0, getTimeZoneKey("UTC")));
 
         // NULL and ±0: equivalence holds
@@ -840,7 +869,8 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testDoubleChainThresholdMatrix()
     {
         // negative half-millis boundary on a double leaf, all six operators
-        Constant tm62 = new Constant(TIMESTAMP_TZ_MICROS,
+        Constant tm62 = new Constant(
+                TIMESTAMP_TZ_MICROS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(-62, 0, getTimeZoneKey("UTC")));
         Expression doubleChain = widenedDoubleChain();
         for (ComparisonOperator op : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, EQUAL, NOT_EQUAL)) {
@@ -853,7 +883,8 @@ public class TestUnwrapFromUnixTimeInComparison
         }
 
         // non-binary-exact double divisors over a double column, both threshold sides, all six operators
-        Constant t62 = new Constant(TIMESTAMP_TZ_MICROS,
+        Constant t62 = new Constant(
+                TIMESTAMP_TZ_MICROS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(62, 0, getTimeZoneKey("UTC")));
         for (double d : new double[] {3.0, 0.1}) {
             Expression divChain = new Cast(new Call(FROM_UNIXTIME, ImmutableList.of(
@@ -876,17 +907,17 @@ public class TestUnwrapFromUnixTimeInComparison
     public void testThresholdAdjustmentNonConvergence()
     {
         // an eval function that never reaches k: the bounded adjustment must fall back to empty
-        assertThat(adjustIntThresholdGE(n -> 0, new BigDecimal("1000"), 5))
+        assertThat(adjustIntThresholdGE(_ -> 0, new BigDecimal("1000"), 5))
                 .isEmpty();
-        assertThat(adjustDoubleThresholdGE(x -> 0, new BigDecimal("0.5"), 5))
+        assertThat(adjustDoubleThresholdGE(_ -> 0, new BigDecimal("0.5"), 5))
                 .isEmpty();
         // an eval function that always satisfies: walking down never converges either
-        assertThat(adjustIntThresholdGE(n -> Long.MAX_VALUE, new BigDecimal("1000"), 5))
+        assertThat(adjustIntThresholdGE(_ -> Long.MAX_VALUE, new BigDecimal("1000"), 5))
                 .isEmpty();
-        assertThat(adjustDoubleThresholdGE(x -> Long.MAX_VALUE, new BigDecimal("0.5"), 5))
+        assertThat(adjustDoubleThresholdGE(_ -> Long.MAX_VALUE, new BigDecimal("0.5"), 5))
                 .isEmpty();
         // walking up from near Long.MAX_VALUE must stop at the overflow guard, not wrap around
-        assertThat(adjustIntThresholdGE(n -> 0, new BigDecimal(Long.MAX_VALUE), 5))
+        assertThat(adjustIntThresholdGE(_ -> 0, new BigDecimal(Long.MAX_VALUE), 5))
                 .isEmpty();
         assertThat(adjustIntThresholdGE(n -> n == Long.MAX_VALUE ? 5 : 0, new BigDecimal(Long.MAX_VALUE), 5))
                 .hasValue(Long.MAX_VALUE);
@@ -912,7 +943,8 @@ public class TestUnwrapFromUnixTimeInComparison
     {
         // x = 0.0625s is binary-exact: x*1000 = 62.5 rounds half-up to 63, so target 62ms must exclude x
         // (correctness review §4 counterexample)
-        Constant t62 = new Constant(TIMESTAMP_TZ_MICROS,
+        Constant t62 = new Constant(
+                TIMESTAMP_TZ_MICROS,
                 LongTimestampWithTimeZone.fromEpochMillisAndFraction(62, 0, getTimeZoneKey("UTC")));
         Expression doubleChain = widenedDoubleChain();
         for (ComparisonOperator op : List.of(EQUAL, NOT_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL)) {
@@ -967,7 +999,8 @@ public class TestUnwrapFromUnixTimeInComparison
         // NULL zone: the original NULL semantics must be preserved
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, chain(null), tzConstant(3, 1000, "UTC")));
         // non-constant zone
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME_ZONE, ImmutableList.of(new Cast(division(N, 1000), DOUBLE), new Reference(createVarcharType(13), "zone"))),
                 tzConstant(3, 1000, "UTC")));
         // (an outer cast to a timestamp without time zone used to be out of scope; the wall clock domain
@@ -975,28 +1008,33 @@ public class TestUnwrapFromUnixTimeInComparison
         // precision-lowering cast on the function side
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, new Cast(chain(), TIMESTAMP_TZ_SECONDS), tzConstant(0, 1000, "UTC")));
         // multiplication instead of division
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(new Call(MULTIPLY_BIGINT, ImmutableList.of(N, new Constant(BIGINT, 1000L))), DOUBLE))),
                 tzConstant(3, 1000, "UTC")));
         // division whose dividend is not a plain column reference
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(division(new Call(MULTIPLY_BIGINT, ImmutableList.of(N, new Constant(BIGINT, 2L))), 1000), DOUBLE))),
                 tzConstant(3, 1000, "UTC")));
         // non-constant or NULL constant side
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, chain(), new Reference(TIMESTAMP_TZ_MILLIS, "other")));
         assertUnchanged(comparison(GREATER_THAN_OR_EQUAL, chain(), new Constant(TIMESTAMP_TZ_MILLIS, null)));
         // negative or zero divisor
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(division(N, -1000), DOUBLE))),
                 tzConstant(3, 1000, "UTC")));
         // non-constant divisor
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(new Call(DIVIDE_BIGINT, ImmutableList.of(N, new Reference(BIGINT, "d"))), DOUBLE))),
                 tzConstant(3, 1000, "UTC")));
         // IS NOT DISTINCT FROM: out of scope
         assertUnchanged(comparison(IDENTICAL, chain(), tzConstant(3, 1000, "UTC")));
         // from_unixtime_nanos with a non-bigint argument
-        assertUnchanged(comparison(GREATER_THAN_OR_EQUAL,
+        assertUnchanged(comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME_NANOS, ImmutableList.of(new Cast(X, BIGINT))),
                 tzConstant(9, 1000, "UTC")));
     }
@@ -1012,7 +1050,8 @@ public class TestUnwrapFromUnixTimeInComparison
         assertThat(evaluatePreservingError(invalidZone, 1000L)).isIn("INVALID_FUNCTION_ARGUMENT", "DEFERRED_TO_RUNTIME");
 
         // division by zero: untouched by the rule, and the original DIVISION_BY_ZERO still fires
-        Expression divZero = comparison(GREATER_THAN_OR_EQUAL,
+        Expression divZero = comparison(
+                GREATER_THAN_OR_EQUAL,
                 new Call(FROM_UNIXTIME, ImmutableList.of(new Cast(division(N, 0), DOUBLE))),
                 tzConstant(3, 1000, "UTC"));
         assertUnchanged(divZero);
