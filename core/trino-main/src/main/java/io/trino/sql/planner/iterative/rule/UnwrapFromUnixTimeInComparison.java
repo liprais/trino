@@ -43,14 +43,14 @@ import io.trino.sql.ir.optimizer.IrExpressionOptimizer;
 import io.trino.sql.planner.Symbol;
 import io.trino.sql.planner.SymbolAllocator;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.zone.ZoneOffsetTransition;
 import java.time.zone.ZoneRules;
-import java.math.BigDecimal;
-import java.math.BigInteger;
-import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -62,7 +62,6 @@ import static io.trino.SystemSessionProperties.isUnwrapFromUnixTimeInComparisonE
 import static io.trino.metadata.GlobalFunctionCatalog.builtinFunctionName;
 import static io.trino.spi.function.OperatorType.DIVIDE;
 import static io.trino.spi.type.BigintType.BIGINT;
-import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.TimeZoneKey.getTimeZoneKey;
@@ -276,16 +275,24 @@ public class UnwrapFromUnixTimeInComparison
      */
     private sealed interface Domain
     {
-        /** compared as timestamp(p) with time zone: instants */
-        record Tz() implements Domain {}
+        /**
+         * compared as timestamp(p) with time zone: instants
+         */
+        record Tz()
+                implements Domain {}
 
-        /** compared as timestamp(p): the chain's instant rendered as a wall clock in the zone */
-        record Local(TimeZoneKey zone) implements Domain {}
+        /**
+         * compared as timestamp(p): the chain's instant rendered as a wall clock in the zone
+         */
+        record Local(TimeZoneKey zone)
+                implements Domain {}
     }
 
     private record Match(Chain chain, Domain domain) {}
 
-    /** a recognized chain together with its rendering zone (null for the nanos chain without AT TIME ZONE) */
+    /**
+     * a recognized chain together with its rendering zone (null for the nanos chain without AT TIME ZONE)
+     */
     private record TzChain(Chain chain, TimeZoneKey zone) {}
 
     private record LocalChain(Chain chain, TimeZoneKey zone) {}
@@ -938,11 +945,11 @@ public class UnwrapFromUnixTimeInComparison
                         }
                         yield gridOperator == EQUAL
                                 ? Optional.of(and(
-                                        comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(BIGINT, bLow.get())),
-                                        comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(BIGINT, bHigh.get()))))
+                                comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(BIGINT, bLow.get())),
+                                comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(BIGINT, bHigh.get()))))
                                 : Optional.of(or(
-                                        comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(BIGINT, bLow.get())),
-                                        comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(BIGINT, bHigh.get()))));
+                                comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(BIGINT, bLow.get())),
+                                comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(BIGINT, bHigh.get()))));
                     }
                     default -> Optional.empty();
                 };
@@ -958,11 +965,11 @@ public class UnwrapFromUnixTimeInComparison
                     }
                     yield gridOperator == EQUAL
                             ? Optional.of(and(
-                                    comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(DOUBLE, bLow.get())),
-                                    comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(DOUBLE, bHigh.get()))))
+                            comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(DOUBLE, bLow.get())),
+                            comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(DOUBLE, bHigh.get()))))
                             : Optional.of(or(
-                                    comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(DOUBLE, bLow.get())),
-                                    comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(DOUBLE, bHigh.get()))));
+                            comparison(metadata, getCharVarcharCoercion(session), LESS_THAN, leaf, new Constant(DOUBLE, bLow.get())),
+                            comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(DOUBLE, bHigh.get()))));
                 }
                 default -> Optional.empty();
             };
@@ -1060,15 +1067,13 @@ public class UnwrapFromUnixTimeInComparison
                 if (!fraction) {
                     Constant bound = new Constant(BIGINT, nanos.longValueExact());
                     return switch (operator) {
-                        case EQUAL, NOT_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL ->
-                                Optional.of(comparison(metadata, getCharVarcharCoercion(session), operator, leaf, bound));
+                        case EQUAL, NOT_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL -> Optional.of(comparison(metadata, getCharVarcharCoercion(session), operator, leaf, bound));
                         case IDENTICAL -> Optional.empty();
                     };
                 }
                 // sub-nanosecond constant: tighten toward the satisfying side
                 return switch (operator) {
-                    case GREATER_THAN_OR_EQUAL, GREATER_THAN ->
-                            intComparison(GREATER_THAN_OR_EQUAL, leaf, nanos.add(BigInteger.ONE));
+                    case GREATER_THAN_OR_EQUAL, GREATER_THAN -> intComparison(GREATER_THAN_OR_EQUAL, leaf, nanos.add(BigInteger.ONE));
                     case LESS_THAN, LESS_THAN_OR_EQUAL -> intComparison(LESS_THAN_OR_EQUAL, leaf, nanos);
                     case EQUAL -> Optional.of(and(
                             comparison(metadata, getCharVarcharCoercion(session), GREATER_THAN_OR_EQUAL, leaf, new Constant(BIGINT, 0L)),
