@@ -322,8 +322,10 @@ public class TestUnwrapFromUnixTimeInComparison
                 Expression rewritten = unwrap(original);
                 assertThat(rewritten).as("precision %s, operator %s", precision, operator)
                         .isEqualTo(unwrap(comparison(operator, castToTimestamp(chain("UTC"), precision), boundary)));
-                for (Long n : new Long[] {METABASE_BOUNDARY_K * 1000 - 1, METABASE_BOUNDARY_K * 1000,
-                        METABASE_BOUNDARY_K * 1000 + 1, METABASE_BOUNDARY_K * 1000 + 1000, null}) {
+                for (Long n : new Long[] {
+                        METABASE_BOUNDARY_K * 1000 - 1, METABASE_BOUNDARY_K * 1000,
+                        METABASE_BOUNDARY_K * 1000 + 1, METABASE_BOUNDARY_K * 1000 + 1000, null,
+                }) {
                     assertThat(evaluate(rewritten, n))
                             .as("precision %s, operator %s, n=%s", precision, operator, n)
                             .isEqualTo(evaluate(original, n));
@@ -432,8 +434,10 @@ public class TestUnwrapFromUnixTimeInComparison
             Expression original = comparison(operator, wallClockChain("Asia/Shanghai"), dstEra);
             Expression rewritten = unwrap(original);
             assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
-            for (long n : new long[] {dstInstant - 1000, dstInstant - 1, dstInstant, dstInstant + 1,
-                    dstInstant + 999, dstInstant + 1000, dstInstant + 1001}) {
+            for (long n : new long[] {
+                    dstInstant - 1000, dstInstant - 1, dstInstant, dstInstant + 1,
+                    dstInstant + 999, dstInstant + 1000, dstInstant + 1001,
+            }) {
                 assertThat(evaluate(rewritten, n))
                         .as("operator %s, n=%s", operator, n)
                         .isEqualTo(evaluate(original, n));
@@ -557,15 +561,23 @@ public class TestUnwrapFromUnixTimeInComparison
         // any constant rendering zone is admitted as long as its ambiguity window contains no fall-back, which
         // holds for daylight saving zones on dates far from a transition and for every fixed-offset zone
         Constant boundary = localTimestamp("2026-09-01 00:00:00.000");
-        for (String zone : List.of("America/New_York", "Europe/London", "UTC", "GMT+7", "+05:45",
-                "Asia/Kathmandu", "Pacific/Chatham")) {
+        for (String zone : List.of(
+                "America/New_York",
+                "Europe/London",
+                "UTC",
+                "GMT+7",
+                "+05:45",
+                "Asia/Kathmandu",
+                "Pacific/Chatham")) {
             long instant = ZonedDateTime.of(2026, 9, 1, 0, 0, 0, 0, ZoneId.of(zone)).toEpochSecond() * 1000;
             for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
                 Expression original = comparison(operator, wallClockChain(zone), boundary);
                 Expression rewritten = unwrap(original);
                 assertThat(rewritten).as("zone %s, operator %s", zone, operator).isNotEqualTo(original);
-                for (long n : new long[] {instant - 1000, instant - 1, instant, instant + 1, instant + 999,
-                        instant + 1000, instant + 1001}) {
+                for (long n : new long[] {
+                        instant - 1000, instant - 1, instant, instant + 1, instant + 999,
+                        instant + 1000, instant + 1001,
+                }) {
                     assertThat(evaluate(rewritten, n))
                             .as("zone %s, operator %s, n=%s", zone, operator, n)
                             .isEqualTo(evaluate(original, n));
@@ -721,15 +733,21 @@ public class TestUnwrapFromUnixTimeInComparison
         // wall clock forwards, so it stays non-decreasing and the inversion is exact, including for thresholds
         // inside the hour that no instant renders to.
         long instant = ZonedDateTime.of(2024, 3, 10, 3, 0, 0, 0, ZoneId.of("America/New_York")).toEpochSecond() * 1000;
-        for (String wallClock : List.of("2024-03-10 01:59:59.000", "2024-03-10 02:00:00.000",
-                "2024-03-10 02:30:00.000", "2024-03-10 03:00:00.000", "2024-03-10 03:30:00.000")) {
+        for (String wallClock : List.of(
+                "2024-03-10 01:59:59.000",
+                "2024-03-10 02:00:00.000",
+                "2024-03-10 02:30:00.000",
+                "2024-03-10 03:00:00.000",
+                "2024-03-10 03:30:00.000")) {
             Constant boundary = localTimestamp(wallClock);
             for (ComparisonOperator operator : List.of(GREATER_THAN_OR_EQUAL, LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN)) {
                 Expression original = comparison(operator, wallClockChain("America/New_York"), boundary);
                 Expression rewritten = unwrap(original);
                 assertThat(rewritten).as("wall clock %s, operator %s", wallClock, operator).isNotEqualTo(original);
-                for (long n : new long[] {instant - 3_600_000, instant - 1_800_001, instant - 1_800_000,
-                        instant - 1, instant, instant + 1, instant + 1_800_000}) {
+                for (long n : new long[] {
+                        instant - 3_600_000, instant - 1_800_001, instant - 1_800_000,
+                        instant - 1, instant, instant + 1, instant + 1_800_000,
+                }) {
                     assertThat(evaluate(rewritten, n))
                             .as("wall clock %s, operator %s, n=%s", wallClock, operator, n)
                             .isEqualTo(evaluate(original, n));
@@ -777,8 +795,10 @@ public class TestUnwrapFromUnixTimeInComparison
             Expression original = comparison(operator, wallClockChain("America/New_York"), boundary);
             Expression rewritten = unwrap(original);
             assertThat(rewritten).as("operator %s", operator).isNotEqualTo(original);
-            for (long n : new long[] {crossing - 1000, crossing - 1, crossing, crossing + 1,
-                    fallBack - 1000, fallBack - 1, fallBack, fallBack + 1, fallBack + 1000}) {
+            for (long n : new long[] {
+                    crossing - 1000, crossing - 1, crossing, crossing + 1,
+                    fallBack - 1000, fallBack - 1, fallBack, fallBack + 1, fallBack + 1000,
+            }) {
                 assertThat(evaluate(rewritten, n))
                         .as("operator %s, n=%s", operator, n)
                         .isEqualTo(evaluate(original, n));
@@ -803,8 +823,10 @@ public class TestUnwrapFromUnixTimeInComparison
                 Expression original = comparison(operator, wallClockChain("Pacific/Apia"), boundary);
                 Expression rewritten = unwrap(original);
                 assertThat(rewritten).as("wall clock %s, operator %s", wallClock, operator).isNotEqualTo(original);
-                for (long n : new long[] {instant - 1000, instant - 1, instant, instant + 1, instant + 999,
-                        instant + 1000, instant + 1001, instant + 86_400_000}) {
+                for (long n : new long[] {
+                        instant - 1000, instant - 1, instant, instant + 1, instant + 999,
+                        instant + 1000, instant + 1001, instant + 86_400_000,
+                }) {
                     assertThat(evaluate(rewritten, n))
                             .as("wall clock %s, operator %s, n=%s", wallClock, operator, n)
                             .isEqualTo(evaluate(original, n));
@@ -837,8 +859,10 @@ public class TestUnwrapFromUnixTimeInComparison
                     Expression original = comparison(operator, wallClockChain(zone), boundary);
                     Expression rewritten = unwrap(original);
                     assertThat(rewritten).as("zone %s, wall clock %s, operator %s", zone, wallClock, operator).isNotEqualTo(original);
-                    for (long n : new long[] {instant - 2000, instant - 1000, instant - 1, instant, instant + 1,
-                            instant + 999, instant + 1000, instant + 2000}) {
+                    for (long n : new long[] {
+                            instant - 2000, instant - 1000, instant - 1, instant, instant + 1,
+                            instant + 999, instant + 1000, instant + 2000,
+                    }) {
                         assertThat(evaluate(rewritten, n))
                                 .as("zone %s, wall clock %s, operator %s, n=%s", zone, wallClock, operator, n)
                                 .isEqualTo(evaluate(original, n));
