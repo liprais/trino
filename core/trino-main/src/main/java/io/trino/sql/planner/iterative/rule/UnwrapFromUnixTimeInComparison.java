@@ -208,6 +208,32 @@ public class UnwrapFromUnixTimeInComparison
         return Optional.of(b);
     }
 
+    // Mirrors DateTimeFunctions.unixTimeToEpochMillis: round half away from zero, treating unixTime as a
+    // tie when it is the double nearest a half millisecond. A negative exact tie therefore rounds down
+    // (-0.0625 s is -63 ms, not -62 ms), unlike Math.round. This must stay in sync with the engine:
+    // the adjusted thresholds are verified through this evaluator, so a divergence silently turns the
+    // rewrite into a different predicate at the tie values.
+    @VisibleForTesting
+    static long unixTimeToEpochMillis(double unixTime)
+    {
+        double millis = unixTime * 1000;
+        if (Math.abs(millis) >= 0x1p52) {
+            // Integral and too large to pack; the saturating cast keeps it so
+            return (long) millis;
+        }
+        double floor = Math.floor(millis);
+        double fraction = millis - floor;
+        if (Math.abs(fraction - 0.5) > 2 * Math.ulp(millis)) {
+            return Math.round(millis);
+        }
+        long lowerMillis = (long) floor;
+        double halfMillisecond = (2 * lowerMillis + 1) / 2000.0;
+        if (unixTime > halfMillisecond || (unixTime == halfMillisecond && unixTime > 0)) {
+            return lowerMillis + 1;
+        }
+        return lowerMillis;
+    }
+
     private static double leastDoubleGE(BigDecimal value)
     {
         double result = value.doubleValue();
@@ -990,31 +1016,6 @@ public class UnwrapFromUnixTimeInComparison
         private long evalChainMillis(DoubleChain chain, double leafValue)
         {
             return unixTimeToEpochMillis(leafValue / chain.divisor().doubleValue());
-        }
-
-        // Mirrors DateTimeFunctions.unixTimeToEpochMillis: round half away from zero, treating unixTime as a
-        // tie when it is the double nearest a half millisecond. A negative exact tie therefore rounds down
-        // (-0.0625 s is -63 ms, not -62 ms), unlike Math.round. This must stay in sync with the engine:
-        // the adjusted thresholds are verified through this evaluator, so a divergence silently turns the
-        // rewrite into a different predicate at the tie values.
-        private static long unixTimeToEpochMillis(double unixTime)
-        {
-            double millis = unixTime * 1000;
-            if (Math.abs(millis) >= 0x1p52) {
-                // Integral and too large to pack; the saturating cast keeps it so
-                return (long) millis;
-            }
-            double floor = Math.floor(millis);
-            double fraction = millis - floor;
-            if (Math.abs(fraction - 0.5) > 2 * Math.ulp(millis)) {
-                return Math.round(millis);
-            }
-            long lowerMillis = (long) floor;
-            double halfMillisecond = (2 * lowerMillis + 1) / 2000.0;
-            if (unixTime > halfMillisecond || (unixTime == halfMillisecond && unixTime > 0)) {
-                return lowerMillis + 1;
-            }
-            return lowerMillis;
         }
 
         // smallest bigint n whose chain output is >= k, found by adjusting the analytic guess against

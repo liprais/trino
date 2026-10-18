@@ -52,6 +52,7 @@ import static io.trino.SessionTestUtils.TEST_SESSION;
 import static io.trino.SystemSessionProperties.getCharVarcharCoercion;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
+import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.TimeZoneKey.getTimeZoneKey;
 import static io.trino.spi.type.TimestampType.TIMESTAMP_MICROS;
@@ -1094,6 +1095,47 @@ public class TestUnwrapFromUnixTimeInComparison
         assertThat(evaluateDouble(rewritten, -0.0625)).isFalse();
         assertThat(evaluateDouble(rewritten, Math.nextUp(-0.0625))).isTrue();
         assertThat(evaluateDouble(rewritten, Math.nextDown(-0.0625))).isFalse();
+    }
+
+    @Test
+    public void testRoundingMatchesFromUnixtime()
+    {
+        // The rule mirrors DateTimeFunctions.unixTimeToEpochMillis. If the engine changes its rounding again
+        // (484 changed it to round half away from zero), this sweep fails instead of silently producing a
+        // rewrite that is not equivalent to the original expression at the tie values.
+        long[] halves = {-63, -62, -2, -1, 0, 1, 2, 61, 62};
+        for (long half : halves) {
+            double tie = (2 * half + 1) / 2000.0;
+            double[] samples = {
+                    Math.nextDown(Math.nextDown(Math.nextDown(tie))),
+                    Math.nextDown(Math.nextDown(tie)),
+                    Math.nextDown(tie),
+                    tie,
+                    Math.nextUp(tie),
+                    Math.nextUp(Math.nextUp(tie)),
+                    Math.nextUp(Math.nextUp(Math.nextUp(tie))),
+            };
+            for (double x : samples) {
+                assertThat(UnwrapFromUnixTimeInComparison.unixTimeToEpochMillis(x))
+                        .as("half=%s x=%s", half, x)
+                        .isEqualTo(realFromUnixtimeMillis(x));
+            }
+        }
+        for (double x : new double[] {-1e9, -1.5, -0.0626, -0.0624, -0.0015, 0.0, 1e-7, 0.5, 1.5, 1e9}) {
+            assertThat(UnwrapFromUnixTimeInComparison.unixTimeToEpochMillis(x))
+                    .as("x=%s", x)
+                    .isEqualTo(realFromUnixtimeMillis(x));
+        }
+    }
+
+    private static long realFromUnixtimeMillis(double x)
+    {
+        Expression expression = new Call(FROM_UNIXTIME, ImmutableList.of(new Constant(DOUBLE, x)));
+        Expression result = FUNCTIONS.getPlannerContext().getExpressionOptimizer()
+                .process(expression, TEST_SESSION, emptySymbolAllocator(), ImmutableMap.of())
+                .orElse(expression);
+        assertThat(result).isInstanceOf(Constant.class);
+        return unpackMillisUtc((Long) ((Constant) result).value());
     }
 
     @Test
