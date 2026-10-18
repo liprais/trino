@@ -866,6 +866,23 @@ public class TestUnwrapFromUnixTimeInComparison
     }
 
     @Test
+    public void testNegativeHalfMillisecondTieRoundsAwayFromZero()
+    {
+        // from_unixtime rounds a half millisecond away from zero: -0.0625 s is -63 ms, not -62 ms. The
+        // rewritten bound must therefore exclude -0.0625 when comparing with -62 ms. Rounding half up
+        // (the pre-484 Math.round behavior) would have included it and returned one row too many.
+        Constant minus62Millis = new Constant(
+                TIMESTAMP_TZ_MICROS,
+                LongTimestampWithTimeZone.fromEpochMillisAndFraction(-62, 0, getTimeZoneKey("UTC")));
+        Expression original = comparison(GREATER_THAN_OR_EQUAL, widenedDoubleChain(), minus62Millis);
+        Expression rewritten = unwrap(original);
+        assertThat(rewritten).isNotEqualTo(original);
+        assertThat(evaluateDouble(rewritten, -0.0625)).isFalse();
+        assertThat(evaluateDouble(rewritten, Math.nextUp(-0.0625))).isTrue();
+        assertThat(evaluateDouble(rewritten, Math.nextDown(-0.0625))).isFalse();
+    }
+
+    @Test
     public void testDoubleChainThresholdMatrix()
     {
         // negative half-millis boundary on a double leaf, all six operators
